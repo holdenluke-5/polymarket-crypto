@@ -104,6 +104,16 @@ async def test_paper_entry_does_not_touch_live_executor(bot_db) -> None:
     assert transaction["amount_usd"] == pytest.approx(-3.0)
 
 
+def test_paper_detail_tolerates_missing_up_ask() -> None:
+    snapshot = _snapshot()
+    snapshot.market_up_price = None
+
+    detail = paper._detail_from_snapshot(snapshot)
+
+    assert "Polymarket Up: —;" in detail
+    assert "BTC paper loop running" in detail
+
+
 @pytest.mark.asyncio
 async def test_paper_close_does_not_touch_live_executor(bot_db) -> None:
     await paper._maybe_open_position(_snapshot())

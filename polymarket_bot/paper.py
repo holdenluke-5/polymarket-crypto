@@ -1904,6 +1904,11 @@ async def _set_detail(detail: str) -> None:
 
 def _detail_from_snapshot(snapshot: PaperSnapshot) -> str:
     side = snapshot.signal_side or "SKIP"
+    up_price = (
+        "—"
+        if snapshot.market_up_price is None
+        else f"{snapshot.market_up_price:.3f}"
+    )
     if _live_executor is not None:
         header = (
             "BTC LIVE loop running — orders are REAL. "
@@ -1914,7 +1919,7 @@ def _detail_from_snapshot(snapshot: PaperSnapshot) -> str:
     return header + (
         f"Window: {snapshot.window_slug} ({snapshot.remaining_seconds}s left)\n"
         f"Spot: ${snapshot.spot_price:,.2f} vs ref ${snapshot.reference_price:,.2f}\n"
-        f"Polymarket Up: {snapshot.market_up_price:.3f}; fair Up: {snapshot.fair_up_prob:.3f}; "
+        f"Polymarket Up: {up_price}; fair Up: {snapshot.fair_up_prob:.3f}; "
         f"edge: {snapshot.edge:+.3f}\n"
         f"Signal: {side}; confidence {snapshot.confidence:.2f}; notional ${snapshot.notional_usd:.0f}\n"
         f"Gate: {_gate_preview_line(snapshot)}\n"
