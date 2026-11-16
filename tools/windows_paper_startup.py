@@ -14,6 +14,7 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 APP_HOME = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "PolymarketCrypto"
@@ -52,6 +53,73 @@ def _is_copilot_worktree(root: Path) -> bool:
     return "copilot-worktrees" in {part.lower() for part in root.parts}
 
 
+def _public_pr_head_repository(
+    root: Path, remote: str, branch: str
+) -> str | None:
+    if "://" in remote:
+        parsed = urlsplit(remote)
+        host = parsed.hostname
+        parts = parsed.path.strip("/").removesuffix(".git").split("/")
+    else:
+        match = re.fullmatch(r"git@([^:]+):(.+)", remote)
+        if match is None:
+            return None
+        host = match.group(1)
+        parts = match.group(2).removesuffix(".git").split("/")
+    if host != "github.com" or len(parts) != 2:
+        return None
+    upstream = "/".join(parts)
+    head_sha = _git(root, "rev-parse", "HEAD")
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{upstream}/pulls?state=open&per_page=100",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "polymarket-crypto-paper-startup",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15.0) as response:
+            pulls = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not inspect public pull-request refs: {exc}") from exc
+    if not isinstance(pulls, list):
+        return None
+    for pull in pulls:
+        if not isinstance(pull, dict):
+            continue
+        head = pull.get("head") or {}
+        base = pull.get("base") or {}
+        base_repo = base.get("repo") or {}
+        head_repo = head.get("repo") or {}
+        full_name = head_repo.get("full_name")
+        if (
+            head.get("ref") == branch
+            and head.get("sha") == head_sha
+            and base_repo.get("full_name", "").lower() == upstream.lower()
+            and isinstance(full_name, str)
+            and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", full_name)
+        ):
+            return full_name
+    return None
+
+
+def _published_branch_remote(root: Path, branch: str) -> str:
+    remote = _git(root, "remote", "get-url", "origin")
+    refs = _run(
+        ["git", "ls-remote", "--heads", remote, f"refs/heads/{branch}"],
+        cwd=root,
+    ).stdout.strip()
+    if refs:
+        return remote
+
+    repo = _public_pr_head_repository(root, remote, branch)
+    if repo is None:
+        raise RuntimeError(
+            f"Branch {branch!r} is not published to origin or an open PR head."
+        )
+    return f"https://github.com/{repo}.git"
+
+
 def _sanitized_environment() -> dict[str, str]:
     env = os.environ.copy()
     for key in list(env):
@@ -82,7 +150,7 @@ def _ensure_durable_repository() -> Path:
         return REPOSITORY_ROOT
 
     branch = _git(REPOSITORY_ROOT, "branch", "--show-current")
-    remote = _git(REPOSITORY_ROOT, "remote", "get-url", "origin")
+    remote = _published_branch_remote(REPOSITORY_ROOT, branch)
     if not branch or not remote:
         raise RuntimeError("Cannot install: the source checkout has no branch or origin.")
 

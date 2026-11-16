@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib
+import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -78,8 +80,6 @@ def test_task_environment_is_paper_only_and_drops_credentials(
 
 
 def test_copilot_worktree_is_not_a_durable_install() -> None:
-    from pathlib import Path
-
     assert startup._is_copilot_worktree(
         Path(r"C:\Users\user\.copilot\repos\copilot-worktrees\repo\worktree")
     )
@@ -100,4 +100,28 @@ def test_current_btc_contract_requires_a_recent_window() -> None:
     )
     assert not startup._has_current_btc_contract(
         {"execution_view": "btc-updown-5m-1700000000"}, now
+    )
+
+
+def test_published_branch_remote_resolves_pr_fork(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        startup,
+        "_git",
+        lambda *_args, **_kwargs: "https://github.com/zayansalman/polymarket-crypto.git",
+    )
+    monkeypatch.setattr(
+        startup,
+        "_public_pr_head_repository",
+        lambda *_args, **_kwargs: "holdenluke-5/polymarket-crypto",
+    )
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(startup, "_run", fake_run)
+
+    assert startup._published_branch_remote(tmp_path, "feature") == (
+        "https://github.com/holdenluke-5/polymarket-crypto.git"
     )
