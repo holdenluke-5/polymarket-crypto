@@ -242,6 +242,58 @@ def _dashboard_data(timeout: float = 2.0) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) and "runtime" in payload else None
 
 
+def _dashboard_listener_pids() -> set[int]:
+    powershell = (
+        "$ErrorActionPreference = 'Stop'; "
+        f"Get-NetTCPConnection -LocalPort {PORT} -State Listen "
+        "-ErrorAction SilentlyContinue | "
+        "Select-Object -ExpandProperty OwningProcess -Unique"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", powershell],
+        env=_sanitized_environment(),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        raise RuntimeError(
+            "Could not verify which process owns the dashboard port: "
+            + (result.stderr.strip() or result.stdout.strip())
+        )
+    try:
+        return {int(line.strip()) for line in result.stdout.splitlines() if line.strip()}
+    except ValueError as exc:
+        raise RuntimeError("Could not parse the dashboard listener process ID.") from exc
+
+
+def _dashboard_log_matches_process(pid: int) -> bool:
+    log_path = LOG_ROOT / "dashboard.log"
+    try:
+        with log_path.open("rb") as log_file:
+            log_file.seek(0, os.SEEK_END)
+            log_file.seek(max(0, log_file.tell() - 65536))
+            lines = log_file.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+
+    expected_db_path = str(DATA_ROOT / "btc_5m_binary_fair_value.db").lower()
+    latest_boot_uses_install = False
+    for line in lines:
+        lowered = line.lower()
+        if "app.boot" in lowered:
+            latest_boot_uses_install = f"db_path={expected_db_path}" in lowered
+        match = re.search(r"started server process \[(\d+)\]", lowered)
+        if match and int(match.group(1)) == pid and latest_boot_uses_install:
+            return True
+    return False
+
+
+def _is_our_dashboard() -> bool:
+    return any(
+        _dashboard_log_matches_process(pid) for pid in _dashboard_listener_pids()
+    )
+
+
 def _start_existing_dashboard(payload: dict[str, Any]) -> None:
     runtime = payload.get("runtime") or {}
     if runtime.get("mode") != "paper":
@@ -249,7 +301,7 @@ def _start_existing_dashboard(payload: dict[str, Any]) -> None:
             "A dashboard is already using port 7860 in non-paper mode; "
             "the startup task did not interact with it."
         )
-    if str(DATA_ROOT).lower() not in str(payload.get("execution_view", "")).lower():
+    if not _is_our_dashboard():
         raise RuntimeError(
             "Port 7860 belongs to a different dashboard installation; "
             "the startup task did not interact with it."
@@ -264,10 +316,21 @@ def _start_existing_dashboard(payload: dict[str, Any]) -> None:
 
 def _has_current_btc_contract(payload: dict[str, Any], now: int | None = None) -> bool:
     html = str(payload.get("execution_view", "")).lower()
+    selector = str(payload.get("market_selector", "")).lower()
     current_time = int(time.time()) if now is None else now
-    for match in re.finditer(r"btc-updown-(5m|15m)-(\d+)", html):
-        duration = 300 if match.group(1) == "5m" else 900
-        start = int(match.group(2))
+    windows = [
+        (match.group(1), int(match.group(2)))
+        for match in re.finditer(r"btc-updown-(5m|15m)-(\d+)", html)
+    ]
+    if re.search(
+        r"""class=['"]mkt-btn active['"]\s+data-timeframe=['"]5m['"]""", selector
+    ):
+        windows.extend(
+            ("5m", int(match.group(1)))
+            for match in re.finditer(r"#(\d{9,10})", html)
+        )
+    for timeframe, start in windows:
+        duration = 300 if timeframe == "5m" else 900
         current_start = current_time - current_time % duration
         if abs(start - current_start) <= duration:
             return True

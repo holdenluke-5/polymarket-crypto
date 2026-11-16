@@ -98,9 +98,40 @@ def test_current_btc_contract_requires_a_recent_window() -> None:
     assert startup._has_current_btc_contract(
         {"execution_view": f"btc-updown-15m-{now - now % 900}"}, now
     )
+    assert startup._has_current_btc_contract(
+        {
+            "execution_view": f"<span class='win'>#{current_start} · 120s</span>",
+            "market_selector": (
+                "<button class='mkt-btn active' data-timeframe='5m'>5m</button>"
+            ),
+        },
+        now,
+    )
+    assert not startup._has_current_btc_contract(
+        {"execution_view": f"#{current_start}"}, now
+    )
     assert not startup._has_current_btc_contract(
         {"execution_view": "btc-updown-5m-1700000000"}, now
     )
+
+
+def test_dashboard_log_matches_only_its_install_and_listener_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    data_root = tmp_path / "data"
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    monkeypatch.setattr(startup, "DATA_ROOT", data_root)
+    monkeypatch.setattr(startup, "LOG_ROOT", log_root)
+    log_path = log_root / "dashboard.log"
+    log_path.write_text(
+        f"app.boot db_path={data_root / 'btc_5m_binary_fair_value.db'}\n"
+        "INFO: Started server process [12345]\n",
+        encoding="utf-8",
+    )
+
+    assert startup._dashboard_log_matches_process(12345)
+    assert not startup._dashboard_log_matches_process(12346)
 
 
 def test_published_branch_remote_resolves_pr_fork(
