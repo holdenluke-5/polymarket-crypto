@@ -19,6 +19,8 @@ import config as _config
 import db as _db
 import polymarket_bot.controller as controller
 import polymarket_bot.paper as paper
+from polymarket_bot import paper_wallet
+from polymarket_exec.ops.dashboard.panels import _data as dashboard_data
 from polymarket_exec.execution.live import LiveOrderResult
 
 
@@ -92,16 +94,86 @@ async def test_paper_entry_does_not_touch_live_executor(bot_db) -> None:
     assert len(rows) == 1
     assert rows[0]["entry_price"] == 0.57
     assert rows[0]["notional_usd"] == 3.0
+    assert await paper_wallet.cash_balance() == pytest.approx(97.0)
+    async with bot_db.connect() as conn:
+        async with conn.execute(
+            "SELECT transaction_type, amount_usd FROM paper_wallet_transactions"
+        ) as cur:
+            transaction = await cur.fetchone()
+    assert transaction["transaction_type"] == "BUY"
+    assert transaction["amount_usd"] == pytest.approx(-3.0)
 
 
 @pytest.mark.asyncio
 async def test_paper_close_does_not_touch_live_executor(bot_db) -> None:
     await paper._maybe_open_position(_snapshot())
     pos = (await _open_positions(bot_db))[0]
-    await paper._close_position(pos, _snapshot(), 0.60, "TARGET")
+    assert await paper._close_position(pos, _snapshot(), 0.60, "TARGET")
     rows = await _open_positions(bot_db)
     assert rows[0]["state"] == "closed"
     assert rows[0]["exit_reason"] == "TARGET"
+    balance_after_close = await paper_wallet.cash_balance()
+    assert balance_after_close == pytest.approx(100.1579)
+    assert not await paper._close_position(pos, _snapshot(), 0.60, "TARGET")
+    assert await paper_wallet.cash_balance() == pytest.approx(balance_after_close)
+
+
+@pytest.mark.asyncio
+async def test_paper_wallet_marks_open_contract_at_current_bid(bot_db) -> None:
+    await paper._maybe_open_position(_snapshot())
+
+    snapshot = await dashboard_data.paper_wallet_snapshot(
+        {"window_slug": "btc-updown-5m-1770000000", "up_best_bid": 0.60}
+    )
+
+    assert snapshot is not None
+    assert snapshot["cash"] == pytest.approx(97.0)
+    assert snapshot["positions"] == pytest.approx(3.1579)
+    assert snapshot["equity"] == pytest.approx(100.1579)
+    assert snapshot["mark_source"] == "current_bid"
+
+
+@pytest.mark.asyncio
+async def test_paper_settlement_credits_virtual_wallet(bot_db) -> None:
+    await paper._maybe_open_position(_snapshot())
+    pos = (await _open_positions(bot_db))[0]
+
+    assert await paper._close_position(
+        pos, _snapshot(), 1.0, "WINDOW_ROLL", settled=True
+    )
+
+    assert await paper_wallet.cash_balance() == pytest.approx(102.2632)
+    async with bot_db.connect() as conn:
+        async with conn.execute(
+            "SELECT transaction_type, amount_usd FROM paper_wallet_transactions "
+            "WHERE transaction_type != 'BUY'"
+        ) as cur:
+            transaction = await cur.fetchone()
+    assert transaction["transaction_type"] == "SETTLEMENT"
+    assert transaction["amount_usd"] == pytest.approx(5.2632)
+
+
+@pytest.mark.asyncio
+async def test_paper_entry_is_blocked_when_virtual_cash_is_insufficient(
+    bot_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(paper, "_risk_gate", None)
+    async with bot_db.connect() as conn:
+        await conn.execute("UPDATE paper_wallet SET cash_usd = 1.00 WHERE wallet_id = 1")
+        await conn.commit()
+
+    await paper._maybe_open_position(_snapshot())
+
+    assert await _open_positions(bot_db) == []
+    assert await paper_wallet.cash_balance() == pytest.approx(1.0)
+    async with bot_db.connect() as conn:
+        async with conn.execute(
+            "SELECT status, error, mode FROM live_orders ORDER BY id DESC LIMIT 1"
+        ) as cur:
+            blocked = await cur.fetchone()
+    assert blocked["status"] == "BLOCKED"
+    assert "insufficient cash" in blocked["error"]
+    assert blocked["mode"] == "paper"
 
 
 # ---------------------------------------------------------------------------

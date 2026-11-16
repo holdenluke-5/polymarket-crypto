@@ -8,6 +8,7 @@
 | Concern | Edit here |
 |---|---|
 | Trading loop, shared pricing math, paper fills | **`polymarket_bot/`** — `paper.py:run_paper_loop` is *the* loop; its executable-edge prototype is paper-only (BTC 5m/15m); live remains strategy-disabled |
+| Persistent paper cash and simulated buy/sell accounting | `db.py` + `polymarket_bot/paper_wallet.py`; the dashboard reads and renders virtual equity in `polymarket_exec/ops/dashboard/panels/` |
 | Execution gates, live CLOB executor, connectors, dashboard, recorder, backtest harness | **`polymarket_exec/`** — `execution/gate.py:RiskGate`, `execution/live.py:LiveExecutor` |
 | Config, DB schema, logging (foundation; imported by both, imports neither) | top-level **`config.py` / `db.py` / `logging_setup.py`** |
 
@@ -18,6 +19,7 @@ They are **bidirectionally coupled**: the FastAPI dashboard imports `polymarket_
 | Change | File |
 |---|---|
 | Plug in a **new strategy** (the loop's entry decision) | `polymarket_bot/paper.py:_build_snapshot` — the `NO_STRATEGY_REASON` block |
+| Change virtual paper-wallet accounting | `polymarket_bot/paper_wallet.py` and the paper entry/close paths in `polymarket_bot/paper.py` |
 | Shared pricing math (fair value, sigma) used by shadow/daily/backtests | `polymarket_bot/strategy.py` (NOT `polymarket_exec/strategy/` — that only feeds backtests) |
 | Risk limits / kill-switch / daily-loss halt | `polymarket_exec/execution/gate.py` |
 | Live order placement | `polymarket_exec/execution/live.py` |
@@ -77,7 +79,7 @@ Env knobs: `BTC_TRADE_*` are canonical; `BTC_LIVE_*` are deprecated read-aliases
 <!-- BEGIN GENERATED:summary -->
 - **Trees:** `polymarket_bot/` = live loop + signal math; `polymarket_exec/` = execution/connectors/dashboard/backtest; top-level `config.py`/`db.py`/`logging_setup.py` = foundation. Both ACTIVE, bidirectionally coupled.
 - **Entry:** `python main.py` → FastAPI `polymarket_exec/ops/dashboard/app.py`; loop starts on operator ▶ Start → `polymarket_bot/controller.py:request_start`.
-- **Tests:** 1123.
+- **Tests:** 1130.
 - **Built-but-dead (do not edit expecting runtime effect):** `polymarket_bot/chronos_signal.py`, `polymarket_exec/backtest/conditional.py`, `polymarket_exec/backtest/harness.py`, `polymarket_exec/connectors/base.py`, `polymarket_exec/connectors/binance.py`, `polymarket_exec/connectors/chainlink.py`, `polymarket_exec/connectors/polymarket.py`, `polymarket_exec/ops/controller.py`, `polymarket_exec/ops/dashboard/panels/_shared.py`, `polymarket_exec/storage/replay.py`, `polymarket_exec/strategy/signal.py`.
 <!-- END GENERATED:summary -->
 
@@ -86,7 +88,7 @@ Env knobs: `BTC_TRADE_*` are canonical; `BTC_LIVE_*` are deprecated read-aliases
 |---|---|---|---|
 | `config.py` | WIRED | 28 | Configuration for the local Polymarket crypto trading lab. |
 | `dashboard.py` | WIRED | 1 | Local Gradio dashboard for BTC 5-minute paper trading. |
-| `db.py` | WIRED | 16 | SQLite storage for the local Polymarket crypto trading lab. |
+| `db.py` | WIRED | 17 | SQLite storage for the local Polymarket crypto trading lab. |
 | `logging_setup.py` | WIRED | 12 | Structured JSON logging with structlog. Module + trade_id context. |
 | `main.py` | cli | 0 | Entrypoint for the BTC 5-minute paper trading system. |
 | `polymarket_bot/__init__.py` | pkg | 12 | BTC 5-minute paper-trading package. |
@@ -111,6 +113,7 @@ Env knobs: `BTC_TRADE_*` are canonical; `BTC_LIVE_*` are deprecated read-aliases
 | `polymarket_bot/pairarb/quoter.py` | WIRED | 1 | Two-sided quote placement for the 5m Up/Down pair strategy (#182). |
 | `polymarket_bot/pairarb/types.py` | WIRED | 3 | Shared data contracts for the two-sided pair quoter (#182). |
 | `polymarket_bot/paper.py` | WIRED | 5 | BTC 5-minute trading engine (paper by default, live opt-in). |
+| `polymarket_bot/paper_wallet.py` | WIRED | 1 | Persistent simulated cash ledger for BTC paper trades. |
 | `polymarket_bot/regime/__init__.py` | pkg | 2 | Market regime overview: volatility, volume, move, jumps, book, session — advisory only. |
 | `polymarket_bot/regime/classify.py` | WIRED | 2 | A-priori regime bands and the advisory strategy-feasibility table. |
 | `polymarket_bot/regime/features.py` | WIRED | 3 | Pure regime feature math over :class:`~polymarket_bot.regime.types.Bar` lists. |

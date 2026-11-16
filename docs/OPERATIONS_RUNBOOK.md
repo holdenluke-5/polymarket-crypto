@@ -29,6 +29,15 @@ http://127.0.0.1:7860
 - Press **Stop** to halt new paper entries and force-close open simulated
   positions.
 - Use **Refresh** if you want an immediate dashboard update between timer ticks.
+- Paper mode has a separate **$100 virtual wallet**, initialized once in the
+  local SQLite database. Simulated buys debit their entry cost; sells and
+  settlements credit simulated proceeds. The `Paper Equity` ribbon shows
+  virtual cash plus open-position value, marked at the current contract bid
+  when available and otherwise at cost basis (shown in the ribbon).
+- The virtual balance persists across restarts and is never automatically
+  refilled. There is no dashboard reset control; resetting it requires a
+  deliberate local database reset, which also removes the associated paper
+  history. It is not connected to a Polymarket account or real funds.
 
 ## Repeatable Trial Checks
 

@@ -49,6 +49,7 @@ from config import (
 import config as _config
 from polymarket_bot import market_selection as _market_selection
 from polymarket_bot import runtime_knobs as _knobs
+from polymarket_bot import paper_wallet
 from db import connect, get_config, journal_live_order, notify, set_config
 from logging_setup import get_logger
 from polymarket_exec.connectors.chainlink_settlement import (
@@ -1320,6 +1321,8 @@ async def _maybe_open_position(snapshot: PaperSnapshot) -> None:
         position_id = await _insert_position_row(
             snapshot, entry_price, notional, shares
         )
+        if position_id is None:
+            raise RuntimeError("live position row was unexpectedly not created")
         result = await executor.submit_entry(
             token_id=_token_id_for_side(snapshot, snapshot.signal_side),
             side_price=entry_price,
@@ -1369,7 +1372,44 @@ async def _maybe_open_position(snapshot: PaperSnapshot) -> None:
                     reason=blocked,
                 )
                 return
-        await _insert_position_row(snapshot, entry_price, notional, shares)
+        position_id = await _insert_position_row(
+            snapshot,
+            entry_price,
+            notional,
+            shares,
+            debit_paper_wallet=True,
+        )
+        if position_id is None:
+            cash = await paper_wallet.cash_balance()
+            required = round(entry_price * shares, 4)
+            reason = (
+                f"paper wallet has insufficient cash: requires ${required:.2f}, "
+                f"available ${cash:.2f}"
+            )
+            await journal_live_order(
+                intent="ENTRY",
+                side="BUY",
+                status="BLOCKED",
+                window_slug=snapshot.window_slug,
+                token_id=_token_id_for_side(snapshot, snapshot.signal_side),
+                price=entry_price,
+                size=shares,
+                notional_usd=notional,
+                error=reason,
+                mode="paper",
+            )
+            log.info(
+                "paper_entry.blocked_by_wallet",
+                window_slug=snapshot.window_slug,
+                side=snapshot.signal_side,
+                reason=reason,
+            )
+            await notify(
+                "paper_wallet.entry_blocked",
+                reason,
+                {"window_slug": snapshot.window_slug, "required_usd": required},
+            )
+            return
         if gate is not None:
             await gate.record_buy_notional(round(entry_price * shares, 4))
     label = "LIVE" if executor is not None else "Paper"
@@ -1389,10 +1429,16 @@ async def _maybe_open_position(snapshot: PaperSnapshot) -> None:
 
 
 async def _insert_position_row(
-    snapshot: PaperSnapshot, entry_price: float, notional: float, shares: float
-) -> int:
+    snapshot: PaperSnapshot,
+    entry_price: float,
+    notional: float,
+    shares: float,
+    *,
+    debit_paper_wallet: bool = False,
+) -> int | None:
     mode = "live" if _live_executor is not None else "paper"
     async with connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute(
             """
             INSERT INTO paper_positions(
@@ -1420,6 +1466,22 @@ async def _insert_position_row(
             ),
         )
         position_id = int(cur.lastrowid or 0)
+        if debit_paper_wallet:
+            cash_after = await paper_wallet.apply_cash_flow(
+                db,
+                position_id=position_id,
+                window_slug=snapshot.window_slug,
+                transaction_type="BUY",
+                amount_usd=entry_price * shares,
+                details={
+                    "entry_price": entry_price,
+                    "shares": shares,
+                    "notional_usd": notional,
+                },
+            )
+            if cash_after is None:
+                await db.rollback()
+                return None
         await db.commit()
     return position_id
 
@@ -1712,19 +1774,51 @@ async def _close_position(
         pnl = prior_pnl + realized
     else:
         pnl = float(pos["shares"]) * (exit_price - entry_price)
-        # Paper closes feed the SAME daily-loss-halt counter live closes do
-        # (issue #64). Without this, paper losses don't advance the halt and
-        # paper diverges from what live would have done next.
+    if executor is None:
         gate = _risk_gate
-        if gate is not None:
-            await gate.record_realized_pnl(round(pnl - prior_pnl, 4), is_live=False)
+    else:
+        gate = None
     async with connect() as db:
-        await db.execute(
+        await db.execute("BEGIN IMMEDIATE")
+        if executor is None:
+            async with db.execute(
+                "SELECT state FROM paper_positions WHERE position_id = ?",
+                (pos["position_id"],),
+            ) as cur:
+                current = await cur.fetchone()
+            if current is None or current["state"] != "open":
+                await db.rollback()
+                return False
+            if await paper_wallet.has_entry_transaction(db, int(pos["position_id"])):
+                cash_after = await paper_wallet.apply_cash_flow(
+                    db,
+                    position_id=int(pos["position_id"]),
+                    window_slug=str(pos["window_slug"]),
+                    transaction_type="SETTLEMENT" if settled else "SELL",
+                    amount_usd=float(pos["shares"]) * exit_price,
+                    details={
+                        "exit_price": exit_price,
+                        "reason": reason,
+                        "realized_pnl_usd": pnl,
+                    },
+                )
+                if cash_after is None:
+                    raise RuntimeError(
+                        f"paper wallet could not credit closed position "
+                        f"{pos['position_id']}"
+                    )
+            else:
+                log.warning(
+                    "paper_wallet.close_without_entry",
+                    position_id=pos["position_id"],
+                    window_slug=pos["window_slug"],
+                )
+        update = await db.execute(
             """
             UPDATE paper_positions
             SET state = 'closed', closed_at = ?, exit_price = ?,
                 closed_spot = ?, exit_reason = ?, realized_pnl_usd = ?
-            WHERE position_id = ?
+            WHERE position_id = ? AND (? = 1 OR state = 'open')
             """,
             (
                 snapshot.created_at,
@@ -1733,9 +1827,18 @@ async def _close_position(
                 reason,
                 pnl,
                 pos["position_id"],
+                1 if executor is not None else 0,
             ),
         )
+        if update.rowcount != 1:
+            await db.rollback()
+            return False
         await db.commit()
+    # Paper closes feed the SAME daily-loss-halt counter live closes do
+    # (issue #64). Without this, paper losses don't advance the halt and
+    # paper diverges from what live would have done next.
+    if gate is not None:
+        await gate.record_realized_pnl(round(pnl - prior_pnl, 4), is_live=False)
     await notify(
         "live_exit" if executor is not None else "paper_exit",
         f"{'LIVE' if executor is not None else 'Paper'} EXIT {pos['side']} ${pnl:+.2f} ({reason})",

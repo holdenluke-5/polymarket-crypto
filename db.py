@@ -11,6 +11,8 @@ import aiosqlite
 from config import DB_PATH
 from logging_setup import redact_secrets
 
+PAPER_WALLET_INITIAL_CASH_USD = 100.0
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS notification_feed (
@@ -91,6 +93,28 @@ CREATE INDEX IF NOT EXISTS idx_paper_positions_state
   ON paper_positions(state);
 CREATE INDEX IF NOT EXISTS idx_paper_positions_opened
   ON paper_positions(opened_at DESC);
+
+CREATE TABLE IF NOT EXISTS paper_wallet (
+  wallet_id INTEGER PRIMARY KEY CHECK(wallet_id = 1),
+  initial_cash_usd REAL NOT NULL,
+  cash_usd REAL NOT NULL,
+  initialized_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_wallet_transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  position_id INTEGER NOT NULL,
+  window_slug TEXT NOT NULL,
+  transaction_type TEXT NOT NULL
+    CHECK(transaction_type IN ('BUY', 'SELL', 'SETTLEMENT')),
+  amount_usd REAL NOT NULL,
+  cash_after_usd REAL NOT NULL,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  UNIQUE(position_id, transaction_type)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_wallet_one_exit
+  ON paper_wallet_transactions(position_id)
+  WHERE transaction_type IN ('SELL', 'SETTLEMENT');
 
 CREATE TABLE IF NOT EXISTS live_orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -369,6 +393,18 @@ async def init_db() -> None:
         await _backfill_position_mode(db)
         await _backfill_live_order_mode(db)
         await _backfill_placement_status(db)
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO paper_wallet(
+              wallet_id, initial_cash_usd, cash_usd, initialized_at
+            ) VALUES (1, ?, ?, ?)
+            """,
+            (
+                PAPER_WALLET_INITIAL_CASH_USD,
+                PAPER_WALLET_INITIAL_CASH_USD,
+                utc_now_iso(),
+            ),
+        )
         await db.commit()
 
 
