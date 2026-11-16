@@ -1,4 +1,4 @@
-"""Install and control a user-scoped Windows on-logon paper-trading task."""
+"""Install and launch the user-scoped Windows paper-trading dashboard."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ INSTALL_ROOT = APP_HOME / "repository"
 DATA_ROOT = APP_HOME / "data"
 LOG_ROOT = APP_HOME / "logs"
 TASK_NAME = "PolymarketCryptoPaper"
+SHORTCUT_NAME = "Start Polymarket Paper Trading.lnk"
 PORT = 7860
 URL = f"http://127.0.0.1:{PORT}"
 
@@ -232,6 +233,51 @@ def _register_task(root: Path) -> None:
         )
 
 
+def _create_desktop_shortcut(root: Path) -> Path:
+    """Create or replace the current user's paper-only desktop launcher."""
+    if os.name != "nt":
+        raise RuntimeError("The desktop launcher is supported on Windows only.")
+    python, _pythonw = _python_paths(root)
+    script = root / "tools" / "windows_paper_startup.py"
+
+    def ps_quote(value: str | Path) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    arguments = f'"{script}" run'
+    powershell = "\n".join(
+        [
+            "$ErrorActionPreference = 'Stop'",
+            "$desktop = [Environment]::GetFolderPath('Desktop')",
+            "if ([string]::IsNullOrWhiteSpace($desktop)) { "
+            "throw 'Could not resolve the current user desktop.' }",
+            f"$shortcutPath = Join-Path $desktop {ps_quote(SHORTCUT_NAME)}",
+            "$shell = New-Object -ComObject WScript.Shell",
+            "$shortcut = $shell.CreateShortcut($shortcutPath)",
+            f"$shortcut.TargetPath = {ps_quote(python)}",
+            f"$shortcut.Arguments = {ps_quote(arguments)}",
+            f"$shortcut.WorkingDirectory = {ps_quote(root)}",
+            "$shortcut.Description = 'Start the local Polymarket BTC paper dashboard'",
+            "$shortcut.Save()",
+            "Write-Output $shortcutPath",
+        ]
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", powershell],
+        env=_sanitized_environment(),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        raise RuntimeError(
+            "Could not create the current-user desktop launcher: "
+            + (result.stderr.strip() or result.stdout.strip())
+        )
+    path = result.stdout.strip()
+    if not path:
+        raise RuntimeError("Windows did not return the desktop launcher path.")
+    return Path(path)
+
+
 def _dashboard_data(timeout: float = 2.0) -> dict[str, Any] | None:
     request = urllib.request.Request(f"{URL}/api/data")
     try:
@@ -405,10 +451,11 @@ def install() -> None:
     )
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     _register_task(root)
+    shortcut = _create_desktop_shortcut(root)
     _run_service(root)
     print(
         f"Installed {TASK_NAME} for the current Windows user. "
-        f"Repository: {root}; data: {DATA_ROOT}"
+        f"Desktop launcher: {shortcut}; repository: {root}; data: {DATA_ROOT}"
     )
 
 
@@ -418,7 +465,10 @@ def uninstall() -> None:
     powershell = (
         "$ErrorActionPreference = 'Stop'; "
         f"Unregister-ScheduledTask -TaskName '{TASK_NAME}' "
-        "-Confirm:$false -ErrorAction SilentlyContinue"
+        "-Confirm:$false -ErrorAction SilentlyContinue; "
+        "$desktop = [Environment]::GetFolderPath('Desktop'); "
+        f"Remove-Item -LiteralPath (Join-Path $desktop '{SHORTCUT_NAME}') "
+        "-Force -ErrorAction SilentlyContinue"
     )
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", powershell],

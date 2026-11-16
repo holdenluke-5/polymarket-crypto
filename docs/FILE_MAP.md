@@ -121,4 +121,4 @@ _Status: `WIRED` = has non-test importers; `DEAD?` = no importers found (investi
 | `tools/run_paper_trials.py` | cli | 0 | Provision a local test environment and run deterministic BTC paper trials. |
 | `tools/shadow_performance.py` | cli | 1 | Per-model performance comparison for the shadow forward-tester. |
 | `tools/venue_recorder.py` | cli | 1 | Venue recorder — the research program's one blocking build item (C17). |
-| `tools/windows_paper_startup.py` | cli | 0 | Install and control a user-scoped Windows on-logon paper-trading task. |
+| `tools/windows_paper_startup.py` | cli | 0 | Install and launch the user-scoped Windows paper-trading dashboard. |

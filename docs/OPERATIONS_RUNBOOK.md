@@ -74,6 +74,13 @@ Run once from the repository checkout:
 py -3.11 tools\windows_paper_startup.py install
 ```
 
+The installer creates the **Start Polymarket Paper Trading** shortcut on your
+Windows desktop. Double-click it whenever you want the dashboard opened and the
+paper loop started. It reuses the durable installation and current dashboard;
+repeated clicks do not create another runner. The dashboard starts or keeps
+running only in paper mode, and its normal signal/risk guards still decide
+whether to open a simulated position.
+
 The task defaults to the saved BTC timeframe (5m for a fresh install). BTC 5m
 and 15m are both supported, but only one timeframe can run in the current
 single-loop/single-position design. Choose the active timeframe in the dashboard;
@@ -89,9 +96,10 @@ Remove the scheduled start with:
 ```
 
 Uninstall removes the login task but preserves the repository, database, and
-logs. A dashboard already running remains open; use its Stop control to stop
-paper entries. `main.py` uses a platform-specific singleton lock and now runs
-natively on Windows; no WSL installation is needed.
+logs, and removes the desktop launcher. A dashboard already running remains
+open; use its Stop control to stop paper entries. `main.py` uses a
+platform-specific singleton lock and now runs natively on Windows; no WSL
+installation is needed.
 
 For a historical replay against resolved BTC markets (downloads public data,
 does not use account credentials), run:

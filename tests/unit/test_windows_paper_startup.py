@@ -79,6 +79,67 @@ def test_task_environment_is_paper_only_and_drops_credentials(
     assert "COPILOT_GH_ACCOUNT_example" not in env
 
 
+def test_desktop_shortcut_is_idempotent_and_targets_paper_launcher(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(startup.os, "name", "nt")
+    root = tmp_path / "Polymarket's repository"
+    python = root / ".venv" / "Scripts" / "python.exe"
+    monkeypatch.setattr(
+        startup,
+        "_python_paths",
+        lambda _root: (python, root / ".venv" / "Scripts" / "pythonw.exe"),
+    )
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs["env"]))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=r"C:\Users\user\Desktop\Start Polymarket Paper Trading.lnk",
+            stderr="",
+        )
+
+    monkeypatch.setattr(startup.subprocess, "run", fake_run)
+
+    first = startup._create_desktop_shortcut(root)
+    second = startup._create_desktop_shortcut(root)
+
+    assert first == second
+    assert len(calls) == 2
+    script = calls[0][0][-1]
+    assert "CreateShortcut($shortcutPath)" in script
+    expected_python = str(python).replace("'", "''")
+    expected_script = str(root / "tools" / "windows_paper_startup.py").replace(
+        "'", "''"
+    )
+    assert f"$shortcut.TargetPath = '{expected_python}'" in script
+    assert (
+        f"$shortcut.Arguments = '\"{expected_script}\" run'" in script
+    )
+    assert "BOT_MODE" in calls[0][1]
+    assert calls[0][1]["BOT_MODE"] == "paper"
+    assert calls[0][1]["POLYMARKET_PRIVATE_KEY"] == ""
+
+
+def test_starting_an_already_running_paper_dashboard_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(startup, "_is_our_dashboard", lambda: True)
+
+    def unexpected_start(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("an already-running paper loop must not be started twice")
+
+    monkeypatch.setattr(startup.urllib.request, "urlopen", unexpected_start)
+
+    startup._start_existing_dashboard(
+        {"runtime": {"mode": "paper", "state": "running"}}
+    )
+
+
 def test_copilot_worktree_is_not_a_durable_install() -> None:
     assert startup._is_copilot_worktree(
         Path(r"C:\Users\user\.copilot\repos\copilot-worktrees\repo\worktree")
