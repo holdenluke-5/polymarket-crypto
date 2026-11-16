@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import secrets
 import sys
 from datetime import UTC, datetime
@@ -119,6 +120,8 @@ async def _lifespan(app: FastAPI):
     from polymarket_exec.execution.gate import migrate_clear_stale_bypass_v76
     await migrate_clear_stale_bypass_v76()
 
+    await _paper_autostart_if_requested()
+
     # Daily altcoin scanner (#185): auto-runs in-process for the dashboard's
     # lifetime — paper-only, no live gate, so no Start/Stop control needed
     # (unlike the BTC loop, which controller.py starts/stops explicitly).
@@ -148,6 +151,22 @@ async def _lifespan(app: FastAPI):
         await daily_task
     with suppress(asyncio.CancelledError):
         await regime_task
+
+
+async def _paper_autostart_if_requested() -> None:
+    """Start paper mode only for the explicit local startup-task launch."""
+    if os.environ.get("BTC_PAPER_AUTOSTART") != "1":
+        return
+    if BOT_MODE != "paper":
+        raise RuntimeError("BTC_PAPER_AUTOSTART requires BOT_MODE=paper.")
+    if not _BTC_BOT_AVAILABLE:
+        raise RuntimeError("BTC_PAPER_AUTOSTART requires the BTC bot modules.")
+
+    await set_mode("paper")
+    status = await request_start()
+    if status.state != "running" or status.mode != "paper":
+        raise RuntimeError(f"Paper auto-start refused: {status.detail}")
+    log.info("btc.paper_autostart_started", mode=status.mode, detail=status.detail)
 
 
 # ---------------------------------------------------------------------------
@@ -895,7 +914,12 @@ async def api_runtime_config(request: Request) -> dict[str, Any]:
             return {"status": "error", "detail": str(e)}
         await notify(
             "runtime_config",
-            f"Operator selected market {sel.asset.upper()} {sel.timeframe} (paper+live)",
+            (
+                f"Operator selected market {sel.asset.upper()} {sel.timeframe} "
+                "(paper only; live remains BTC 5m)"
+                if sel.timeframe == "15m"
+                else f"Operator selected market {sel.asset.upper()} {sel.timeframe} (paper+live)"
+            ),
             {"key": key, "value": {"asset": sel.asset, "timeframe": sel.timeframe}},
         )
         log.info("btc.runtime_config_set", key=key, asset=sel.asset, timeframe=sel.timeframe)

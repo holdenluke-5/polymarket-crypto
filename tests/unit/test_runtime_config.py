@@ -157,3 +157,7 @@ class TestMarketSelectorGlow:
         assert "glow-neg' data-asset='btc'" in mks.render(
             selection=MarketSelection("btc", "5m"), open_pnl=pnl
         )
+        html_15m = mks.render(
+            selection=MarketSelection("btc", "15m"), open_pnl={}
+        )
+        assert "BTC 15m (paper-only; live stays BTC 5m)" in html_15m

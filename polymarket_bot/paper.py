@@ -47,6 +47,7 @@ from config import (
     PRINT_GRANULARITY_USD,
 )
 import config as _config
+from polymarket_bot import market_selection as _market_selection
 from polymarket_bot import runtime_knobs as _knobs
 from db import connect, get_config, journal_live_order, notify, set_config
 from logging_setup import get_logger
@@ -70,6 +71,7 @@ from polymarket_bot.strategy import (
     StrategyParams,
     drift_per_second,
     fair_up_probability,
+    signal_from_executable_edges,
     sigma_per_second,
 )
 
@@ -91,10 +93,7 @@ _chainlink_feed: ChainlinkWsFeed | None = None
 # provisional revision settles, so one stabilized REST read per window.
 _reference_cache: dict[int, float] = {}
 
-# The loop's decision slot. The v0 strategy (entry gates, auto-pause, param
-# tuner, calibration, model picker) was archived 2026-09-13 — see
-# docs/archive/v0-strategy.md. Until a new strategy is plugged in here, every
-# tick journals this reason and no entry is ever taken, in paper AND live.
+# Strategy-disabled snapshots (including live snapshots) keep this reason.
 NO_STRATEGY_REASON = "skip: no strategy loaded"
 
 # --- Loop heartbeat + generation (#147 watchdog) --------------------------
@@ -129,15 +128,14 @@ _MIN_CHAINLINK_SIGMA_POINTS = 30
 
 BINANCE_API = BINANCE_API_BASE
 FIVE_MINUTES = MARKET_TIMEFRAME_MINUTES * 60
+WINDOW_SECONDS = {"5m": FIVE_MINUTES, "15m": 15 * 60}
 
 
 def _strategy_params() -> StrategyParams:
-    """StrategyParams for the shadow forward-tester's candidate roster.
+    """Paper prototype parameters and sizing for the shadow candidate roster.
 
-    Entry thresholds are the archived v0 defaults from ``config`` — the trading
-    loop itself no longer reads them. Sizing reads the in-memory knob cache
-    (``runtime_knobs.cached``), refreshed once per tick by ``paper_tick_once``,
-    so this stays a plain sync function.
+    Thresholds are heuristic defaults, not a claim of profitability. Sizing
+    reads the runtime knob cache refreshed once per paper tick.
     """
     # Operator runtime per-trade cap (#50): when the dashboard control is set,
     # it governs the sizing ceiling too (unified with the gate's effective cap),
@@ -527,7 +525,9 @@ async def paper_tick_once() -> PaperSnapshot:
     # an operator change applies without a restart, same as the gate above.
     await _knobs.refresh_cache()
     async with _make_settlement_client() as client:
-        snapshot = await _build_snapshot(client)
+        snapshot = await _build_snapshot(
+            client, allow_paper_strategy=_live_executor is None
+        )
         await _log_tick(snapshot)
         await _close_due_positions(snapshot, client)
         if not kill_active:
@@ -563,16 +563,22 @@ async def force_close_open_positions(exit_reason: str = "STOP_REQUEST") -> int:
     if not positions:
         return 0
     async with _make_settlement_client() as client:
-        snapshot = await _build_snapshot(client)
-    closed = 0
-    for pos in positions:
-        if await _close_position(
-            pos,
-            snapshot,
-            _current_price_for_side(snapshot, pos["side"]),
-            exit_reason,
-        ):
-            closed += 1
+        snapshot = await _build_snapshot(
+            client, allow_paper_strategy=_live_executor is None
+        )
+        closed = 0
+        for pos in positions:
+            if pos["window_slug"] != snapshot.window_slug:
+                if await _close_rolled_position(pos, snapshot, client):
+                    closed += 1
+                continue
+            if await _close_position(
+                pos,
+                snapshot,
+                _current_price_for_side(snapshot, pos["side"]),
+                exit_reason,
+            ):
+                closed += 1
     return closed
 
 
@@ -817,13 +823,29 @@ def _share_sized_notional(
     return notional
 
 
-async def _build_snapshot(client: httpx.AsyncClient) -> PaperSnapshot:
+async def _build_snapshot(
+    client: httpx.AsyncClient, *, allow_paper_strategy: bool = False
+) -> PaperSnapshot:
     now = _now()
-    market = await _fetch_current_market(client, now)
+    if allow_paper_strategy:
+        selection = await _market_selection.get_selection()
+        if selection.asset != "btc" or selection.timeframe not in WINDOW_SECONDS:
+            raise RuntimeError(
+                "Paper strategy supports BTC 5m and 15m markets only; "
+                f"selected {selection.asset} {selection.timeframe}."
+            )
+        asset, timeframe = selection.asset, selection.timeframe
+    else:
+        # Strategy-free snapshots, including the live path, stay on BTC 5m.
+        asset, timeframe = "btc", "5m"
+    window_seconds = WINDOW_SECONDS[timeframe]
+    market = await _fetch_current_market(
+        client, now, asset=asset, timeframe=timeframe
+    )
     start_ts = int(market["window_start_ts"])
     slug = str(market["slug"])
     question = str(market.get("question") or slug)
-    remaining = max(0, start_ts + FIVE_MINUTES - now)
+    remaining = max(0, start_ts + window_seconds - now)
 
     # Gamma is used for market DISCOVERY only. Its outcomePrices are
     # journaled to quantify staleness, never used for pricing (issue #22).
@@ -879,11 +901,20 @@ async def _build_snapshot(client: httpx.AsyncClient) -> PaperSnapshot:
     else:
         edge_up = edge_down = None
 
-    # No strategy is loaded (v0 archived 2026-09-13): never enter. A degraded
-    # feed still says so, so the operator sees the more urgent reason.
+    # The edge-threshold prototype is paper-only. A degraded feed always
+    # takes precedence so its actual reason remains visible.
     side, confidence, notional = None, 0.0, 0.0
     if degraded_reason is not None:
         reason = f"skip: settlement feed degraded ({degraded_reason})"
+    elif allow_paper_strategy:
+        side, confidence, notional, reason = signal_from_executable_edges(
+            edge_up,
+            edge_down,
+            remaining,
+            up_book.best_ask,
+            down_book.best_ask,
+            _strategy_params(),
+        )
     else:
         reason = NO_STRATEGY_REASON
 
@@ -1052,11 +1083,24 @@ def _best_level(levels: Any) -> tuple[float | None, float | None]:
         return None, None
 
 
-async def _fetch_current_market(client: httpx.AsyncClient, now: int) -> dict[str, Any]:
-    current_start = now - (now % FIVE_MINUTES)
+async def _fetch_current_market(
+    client: httpx.AsyncClient,
+    now: int,
+    *,
+    asset: str = "btc",
+    timeframe: str = "5m",
+) -> dict[str, Any]:
+    window_seconds = WINDOW_SECONDS.get(timeframe)
+    if window_seconds is None:
+        raise ValueError(f"unsupported market timeframe {timeframe!r}")
+    current_start = now - (now % window_seconds)
     # Try current first, then next and previous to handle boundary/API timing.
-    for start_ts in (current_start, current_start + FIVE_MINUTES, current_start - FIVE_MINUTES):
-        slug = f"btc-updown-5m-{start_ts}"
+    for start_ts in (
+        current_start,
+        current_start + window_seconds,
+        current_start - window_seconds,
+    ):
+        slug = f"{asset}-updown-{timeframe}-{start_ts}"
         data = await _gamma_get(client, "markets", {"slug": slug})
         market = _first(data)
         if market is None:
@@ -1068,7 +1112,10 @@ async def _fetch_current_market(client: httpx.AsyncClient, now: int) -> dict[str
             continue
         market["window_start_ts"] = start_ts
         return market
-    raise RuntimeError("Could not discover current BTC 5-minute Polymarket market.")
+    raise RuntimeError(
+        f"Could not discover current {asset.upper()} {timeframe} "
+        "Polymarket market."
+    )
 
 
 async def _gamma_get(
@@ -1483,14 +1530,17 @@ async def _settle_position_outcome(
 ) -> bool | None:
     """True/False when the held side won/lost; None while not yet settleable."""
     start_ts = _window_start_from_slug(pos["window_slug"])
-    if start_ts is None:
+    window_seconds = _window_seconds_from_slug(pos["window_slug"])
+    if start_ts is None or window_seconds is None:
         log.warning(
             "paper_exit.unparseable_window_slug", window_slug=pos["window_slug"]
         )
         return None
     connector = _make_settlement_connector(client, pos["window_slug"])
     try:
-        up_won = await connector.settle_window(start_ts)
+        up_won = await connector.settle_window(
+            start_ts, window_seconds=window_seconds
+        )
     except Exception as e:  # noqa: BLE001
         log.warning(
             "paper_exit.settlement_read_failed",
@@ -1504,11 +1554,19 @@ async def _settle_position_outcome(
 
 
 def _window_start_from_slug(slug: str) -> int | None:
-    """Unix start ts from a btc-updown-5m-<ts> slug, or None."""
+    """Unix start timestamp from an Up/Down market slug, or None."""
     try:
         return int(str(slug).rsplit("-", 1)[-1])
     except (TypeError, ValueError):
         return None
+
+
+def _window_seconds_from_slug(slug: str) -> int | None:
+    """Window duration from a supported Up/Down market slug, or None."""
+    parts = str(slug).rsplit("-", 2)
+    if len(parts) != 3:
+        return None
+    return WINDOW_SECONDS.get(parts[1])
 
 
 async def _settle_due_shadows(
@@ -1531,11 +1589,14 @@ async def _settle_due_shadows(
         if slug == current_slug:
             continue
         start_ts = _window_start_from_slug(slug)
-        if start_ts is None:
+        window_seconds = _window_seconds_from_slug(slug)
+        if start_ts is None or window_seconds is None:
             continue
         connector = _make_settlement_connector(client, slug)
         try:
-            up_won = await connector.settle_window(start_ts)
+            up_won = await connector.settle_window(
+                start_ts, window_seconds=window_seconds
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("shadow.settle_read_failed", window_slug=slug, error=str(exc))
             continue

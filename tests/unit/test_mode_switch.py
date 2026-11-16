@@ -13,6 +13,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -155,8 +156,8 @@ def _stub_closes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     async def _client():
         yield None
 
-    async def _snapshot(_client: object) -> None:
-        return None
+    async def _snapshot(_client: object, **_kwargs: object) -> MagicMock:
+        return MagicMock(window_slug="btc-updown-5m-1")
 
     closed: list[str] = []
 

@@ -22,7 +22,7 @@ _Status: `WIRED` = has non-test importers; `DEAD?` = no importers found (investi
 | `polymarket_bot/daily/signal.py` | WIRED | 1 | Fair-value scoring for the daily altcoin scanner. |
 | `polymarket_bot/daily/types.py` | WIRED | 3 | Shared data contracts for the daily altcoin scanner. |
 | `polymarket_bot/history.py` | WIRED | 3 | Load the user's exported Polymarket history for BTC sizing context. |
-| `polymarket_bot/market_selection.py` | WIRED | 4 | Operator market selection: which crypto asset + window timeframe to trade. |
+| `polymarket_bot/market_selection.py` | WIRED | 6 | Operator market selection: which crypto asset + window timeframe to trade. |
 | `polymarket_bot/pairarb/__init__.py` | pkg | 1 | Two-sided maker quoting on 5-minute Up/Down markets — shadow only (#182). |
 | `polymarket_bot/pairarb/feed.py` | WIRED | 1 | Fill feed for the copier — one interface, two transports (#182). |
 | `polymarket_bot/pairarb/fills.py` | WIRED | 1 | Back-of-queue maker fill simulation and window settlement (#182). |
@@ -117,5 +117,7 @@ _Status: `WIRED` = has non-test importers; `DEAD?` = no importers found (investi
 | `tools/reconcile_live_ledger.py` | cli | 0 | Reconcile the live paper-ledger against the REAL Polymarket account (issue #102). |
 | `tools/regime_attribution.py` | cli | 0 | Regime-attribution instrument for the shadow forward-tester (issue #120). |
 | `tools/replay_race.py` | cli | 0 | Tick-replay backtest for the shadow roster over the FULL quote history (#144). |
+| `tools/run_paper_trials.py` | cli | 0 | Provision a local test environment and run deterministic BTC paper trials. |
 | `tools/shadow_performance.py` | cli | 1 | Per-model performance comparison for the shadow forward-tester. |
 | `tools/venue_recorder.py` | cli | 1 | Venue recorder — the research program's one blocking build item (C17). |
+| `tools/windows_paper_startup.py` | cli | 0 | Install and control a user-scoped Windows on-logon paper-trading task. |

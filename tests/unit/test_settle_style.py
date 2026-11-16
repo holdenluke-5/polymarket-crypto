@@ -15,6 +15,7 @@ import pytest_asyncio
 import db as _db
 import polymarket_bot.paper as paper
 from polymarket_bot import runtime_knobs as _knobs
+from polymarket_bot import market_selection
 from polymarket_exec.execution.live import LiveExecutor
 
 
@@ -395,6 +396,83 @@ async def test_no_strategy_loaded_never_signals_an_entry(test_db, monkeypatch):
     assert snap.signal_side is None
     assert snap.notional_usd == 0.0
     assert snap.reason == paper.NO_STRATEGY_REASON
+
+
+@pytest.mark.asyncio
+async def test_paper_prototype_uses_executable_edge_strategy(test_db, monkeypatch):
+    _stub_market_inputs(monkeypatch, spot=60_004.5)
+
+    snap = await paper._build_snapshot(MagicMock(), allow_paper_strategy=True)
+
+    assert snap.signal_side == "Up"
+    assert 1.0 <= snap.notional_usd <= 5.0
+    assert snap.reason.startswith("enter Up: executable edge")
+
+
+@pytest.mark.asyncio
+async def test_paper_15m_selection_uses_15m_expiry(test_db, monkeypatch):
+    now = 90_123
+    monkeypatch.setattr(paper, "_now", lambda: now)
+    _stub_market_inputs(monkeypatch, spot=60_000.0)
+    await market_selection.set_selection("btc", "15m")
+    fetch_market = paper._fetch_current_market
+
+    snap = await paper._build_snapshot(MagicMock(), allow_paper_strategy=True)
+
+    assert fetch_market.await_args.kwargs == {"asset": "btc", "timeframe": "15m"}
+    assert snap.remaining_seconds == 15 * 60 - 120
+
+
+@pytest.mark.asyncio
+async def test_15m_paper_market_discovery_uses_15m_window(test_db, monkeypatch):
+    now = 90_123
+    expected_start = 90_000
+    requested = []
+
+    async def gamma_get(_client, endpoint, params):
+        requested.append((endpoint, params["slug"]))
+        if params["slug"] == f"btc-updown-15m-{expected_start}":
+            return [{"slug": params["slug"]}]
+        return []
+
+    monkeypatch.setattr(paper, "_gamma_get", gamma_get)
+
+    market = await paper._fetch_current_market(
+        MagicMock(), now, asset="btc", timeframe="15m"
+    )
+
+    assert market["window_start_ts"] == expected_start
+    assert requested == [("markets", f"btc-updown-15m-{expected_start}")]
+
+
+@pytest.mark.asyncio
+async def test_paper_position_settlement_uses_slug_timeframe(monkeypatch):
+    connector = MagicMock()
+    connector.settle_window = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        paper, "_make_settlement_connector", lambda _client, _slug: connector
+    )
+    position = {"window_slug": "btc-updown-15m-90000", "side": "Up"}
+
+    outcome = await paper._settle_position_outcome(position, MagicMock())
+
+    assert outcome is True
+    connector.settle_window.assert_awaited_once_with(
+        90_000, window_seconds=15 * 60
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_snapshot_ignores_15m_paper_selection(test_db, monkeypatch):
+    _stub_market_inputs(monkeypatch, spot=60_004.5)
+    await market_selection.set_selection("btc", "15m")
+    fetch_market = paper._fetch_current_market
+
+    snap = await paper._build_snapshot(MagicMock())
+
+    assert snap.signal_side is None
+    assert snap.reason == paper.NO_STRATEGY_REASON
+    assert fetch_market.await_args.kwargs == {"asset": "btc", "timeframe": "5m"}
 
 
 @pytest.mark.asyncio

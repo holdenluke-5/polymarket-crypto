@@ -20,10 +20,81 @@ http://127.0.0.1:7860
 
 ## Paper Trading
 
-- Press **▶ Start** to begin the BTC 5-minute paper loop (paper is the default mode).
+- Press **▶ Start** to begin the BTC 5m or 15m paper loop (paper is the default mode).
+- Select the timeframe in the dashboard. The 15m prototype is paper-only; live
+  snapshots stay on BTC 5m.
+- The default `settle` exit holds positions to resolution. For simulated
+  intrawindow sells, select `scalp` in Settings; that experimental profile has
+  negative historical results under honest fills.
 - Press **Stop** to halt new paper entries and force-close open simulated
   positions.
 - Use **Refresh** if you want an immediate dashboard update between timer ticks.
+
+## Repeatable Trial Checks
+
+The focused unit tests use deterministic inputs and temporary SQLite databases;
+they do not require a Polymarket account or market-data access. On Windows,
+with Python 3.11 installed:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[test]"
+.\.venv\Scripts\python.exe -m pytest tests\unit\test_settle_style.py tests\unit\test_live_wiring.py tests\unit\test_data_integrity.py tests\unit\test_mode_switch.py tests\unit\test_runtime_config.py tests\unit\test_offline_replay.py tests\unit\test_main_singleton.py tests\unit\test_windows_paper_startup.py -q
+```
+
+The Copilot app's **Run paper BTC trials** script runs the same test selection.
+It creates `.venv` if needed, installs `.[test]`, removes GitHub and Polymarket
+environment credentials from test subprocesses, and forces `BOT_MODE=paper`.
+After adding or changing `.github/github-app.yml`, review and accept the
+repository configuration in the app before using the script. It runs tests
+only; it does not start the dashboard or contact market-data services.
+
+## Automatic Windows Paper Startup
+
+The local startup installer creates a persistent clone under
+`%LOCALAPPDATA%\PolymarketCrypto\repository`, installs runtime dependencies in
+its own `.venv`, and registers a current-user, limited-permission Task Scheduler
+task. It opens the local dashboard at login, starts the BTC loop in paper mode,
+and stores its database/logs under `%LOCALAPPDATA%\PolymarketCrypto`. It
+requires the source branch to be pushed so the persistent clone can be created;
+no administrator permission or Polymarket account is used.
+
+Run once from the repository checkout:
+
+```powershell
+py -3.11 tools\windows_paper_startup.py install
+```
+
+The task defaults to the saved BTC timeframe (5m for a fresh install). BTC 5m
+and 15m are both supported, but only one timeframe can run in the current
+single-loop/single-position design. Choose the active timeframe in the dashboard;
+the automatic task resumes that selection at the next login. Entries are
+strategy-gated, so a connected market does not guarantee a paper buy on every
+window. The dashboard still displays the observed contract and skip reason.
+
+Remove the scheduled start with:
+
+```powershell
+& "$env:LOCALAPPDATA\PolymarketCrypto\repository\.venv\Scripts\python.exe" `
+  "$env:LOCALAPPDATA\PolymarketCrypto\repository\tools\windows_paper_startup.py" uninstall
+```
+
+Uninstall removes the login task but preserves the repository, database, and
+logs. A dashboard already running remains open; use its Stop control to stop
+paper entries. `main.py` uses a platform-specific singleton lock and now runs
+natively on Windows; no WSL installation is needed.
+
+For a historical replay against resolved BTC markets (downloads public data,
+does not use account credentials), run:
+
+```powershell
+.\.venv\Scripts\python.exe tools\offline_replay.py --crypto BTC --timeframe 15-minute --max-markets 250 --output data\replay\btc-15m.json
+```
+
+Use `--timeframe 5-minute` for 5m markets. This replay takes at most one
+position per window and holds it through resolution; it is not an intrawindow
+buy-then-sell simulation. It uses market mid-prices as ask proxies, so results
+are optimistic versus fills at the executable ask.
 
 ## Health Checks
 

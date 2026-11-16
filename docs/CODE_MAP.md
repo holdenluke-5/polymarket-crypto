@@ -7,7 +7,7 @@
 
 | Concern | Edit here |
 |---|---|
-| Trading loop, shared pricing math, paper fills | **`polymarket_bot/`** — `paper.py:run_paper_loop` is *the* loop; no strategy is loaded (v0 archived 2026-09-13, see `docs/archive/v0-strategy.md`) |
+| Trading loop, shared pricing math, paper fills | **`polymarket_bot/`** — `paper.py:run_paper_loop` is *the* loop; its executable-edge prototype is paper-only (BTC 5m/15m); live remains strategy-disabled |
 | Execution gates, live CLOB executor, connectors, dashboard, recorder, backtest harness | **`polymarket_exec/`** — `execution/gate.py:RiskGate`, `execution/live.py:LiveExecutor` |
 | Config, DB schema, logging (foundation; imported by both, imports neither) | top-level **`config.py` / `db.py` / `logging_setup.py`** |
 
@@ -33,7 +33,7 @@ They are **bidirectionally coupled**: the FastAPI dashboard imports `polymarket_
 ```
 main.py ─ singleton lock + init_db ─▶ uvicorn ─▶ polymarket_exec/ops/dashboard/app.py (FastAPI :7860)
    operator ▶ Start ─▶ polymarket_bot/controller.py:request_start ─(daemon thread)─▶ polymarket_bot/paper.py:run_paper_loop
-       DISCOVER market → FEED (chainlink_settlement) → SIGNAL (none loaded — v0 archived)
+       DISCOVER BTC 5m/15m (paper) or BTC 5m (live) → FEED → SIGNAL (paper edge thresholds only)
        → RISK (polymarket_exec/execution/gate.py:RiskGate) → EXECUTE (paper sim | live.py) → STORE (db.py)
    DASHBOARD reads DB read-only via polymarket_exec/ops/dashboard/execution_view.py → panels/
    always-on (dashboard lifespan, no Start/Stop): polymarket_bot/daily/scanner.py (paper) and
@@ -77,7 +77,7 @@ Env knobs: `BTC_TRADE_*` are canonical; `BTC_LIVE_*` are deprecated read-aliases
 <!-- BEGIN GENERATED:summary -->
 - **Trees:** `polymarket_bot/` = live loop + signal math; `polymarket_exec/` = execution/connectors/dashboard/backtest; top-level `config.py`/`db.py`/`logging_setup.py` = foundation. Both ACTIVE, bidirectionally coupled.
 - **Entry:** `python main.py` → FastAPI `polymarket_exec/ops/dashboard/app.py`; loop starts on operator ▶ Start → `polymarket_bot/controller.py:request_start`.
-- **Tests:** 1107.
+- **Tests:** 1121.
 - **Built-but-dead (do not edit expecting runtime effect):** `polymarket_bot/chronos_signal.py`, `polymarket_exec/backtest/conditional.py`, `polymarket_exec/backtest/harness.py`, `polymarket_exec/connectors/base.py`, `polymarket_exec/connectors/binance.py`, `polymarket_exec/connectors/chainlink.py`, `polymarket_exec/connectors/polymarket.py`, `polymarket_exec/ops/controller.py`, `polymarket_exec/ops/dashboard/panels/_shared.py`, `polymarket_exec/storage/replay.py`, `polymarket_exec/strategy/signal.py`.
 <!-- END GENERATED:summary -->
 
@@ -100,7 +100,7 @@ Env knobs: `BTC_TRADE_*` are canonical; `BTC_LIVE_*` are deprecated read-aliases
 | `polymarket_bot/daily/signal.py` | WIRED | 1 | Fair-value scoring for the daily altcoin scanner. |
 | `polymarket_bot/daily/types.py` | WIRED | 3 | Shared data contracts for the daily altcoin scanner. |
 | `polymarket_bot/history.py` | WIRED | 3 | Load the user's exported Polymarket history for BTC sizing context. |
-| `polymarket_bot/market_selection.py` | WIRED | 4 | Operator market selection: which crypto asset + window timeframe to trade. |
+| `polymarket_bot/market_selection.py` | WIRED | 6 | Operator market selection: which crypto asset + window timeframe to trade. |
 | `polymarket_bot/pairarb/__init__.py` | pkg | 1 | Two-sided maker quoting on 5-minute Up/Down markets — shadow only (#182). |
 | `polymarket_bot/pairarb/feed.py` | WIRED | 1 | Fill feed for the copier — one interface, two transports (#182). |
 | `polymarket_bot/pairarb/fills.py` | WIRED | 1 | Back-of-queue maker fill simulation and window settlement (#182). |
@@ -195,8 +195,10 @@ Env knobs: `BTC_TRADE_*` are canonical; `BTC_LIVE_*` are deprecated read-aliases
 | `tools/reconcile_live_ledger.py` | cli | 0 | Reconcile the live paper-ledger against the REAL Polymarket account (issue #102). |
 | `tools/regime_attribution.py` | cli | 0 | Regime-attribution instrument for the shadow forward-tester (issue #120). |
 | `tools/replay_race.py` | cli | 0 | Tick-replay backtest for the shadow roster over the FULL quote history (#144). |
+| `tools/run_paper_trials.py` | cli | 0 | Provision a local test environment and run deterministic BTC paper trials. |
 | `tools/shadow_performance.py` | cli | 1 | Per-model performance comparison for the shadow forward-tester. |
 | `tools/venue_recorder.py` | cli | 1 | Venue recorder — the research program's one blocking build item (C17). |
+| `tools/windows_paper_startup.py` | cli | 0 | Install and control a user-scoped Windows on-logon paper-trading task. |
 <!-- END GENERATED:inventory -->
 
 See `docs/FILE_MAP.md` for the full generated index.
