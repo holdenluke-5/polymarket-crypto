@@ -1250,6 +1250,12 @@ async def _maybe_open_position(snapshot: PaperSnapshot) -> None:
             "SELECT COUNT(*) AS n FROM paper_positions WHERE state = 'open'"
         ) as cur:
             if (await cur.fetchone())["n"]:
+                log.info(
+                    "paper_entry.skipped_open_position",
+                    window_slug=snapshot.window_slug,
+                    side=snapshot.signal_side,
+                    reason="another position is already open",
+                )
                 return
         if _knobs.cached('exit_style') == "settle":
             # One entry per window, ever (issue #28): re-entering the same
@@ -1260,6 +1266,12 @@ async def _maybe_open_position(snapshot: PaperSnapshot) -> None:
                 (snapshot.window_slug,),
             ) as cur:
                 if (await cur.fetchone())["n"]:
+                    log.info(
+                        "paper_entry.skipped_window_already_traded",
+                        window_slug=snapshot.window_slug,
+                        side=snapshot.signal_side,
+                        reason="settle style allows one entry per window",
+                    )
                     return
     # Honest paper fill (issue #22): a BUY fills at the side's best ASK,
     # capped by the top-of-book size. No ask means no executable entry.

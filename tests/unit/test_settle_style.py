@@ -94,6 +94,8 @@ def test_scalp_style_still_scalps(monkeypatch: pytest.MonkeyPatch):
 @pytest.mark.asyncio
 async def test_one_entry_per_window(test_db, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(paper, "_live_executor", None)
+    logger = MagicMock()
+    monkeypatch.setattr(paper, "log", logger)
     snap = _snapshot()
     await paper._maybe_open_position(snap)
     async with paper.connect() as db:
@@ -106,8 +108,16 @@ async def test_one_entry_per_window(test_db, monkeypatch: pytest.MonkeyPatch):
     async with paper.connect() as db:
         async with db.execute("SELECT COUNT(*) AS n FROM paper_positions") as cur:
             assert (await cur.fetchone())["n"] == 1
-    # A new window is a fresh signal.
-    await paper._maybe_open_position(_snapshot(window_slug="btc-updown-5m-1781160300"))
+    logger.info.assert_any_call(
+        "paper_entry.skipped_window_already_traded",
+        window_slug=snap.window_slug,
+        side="Up",
+        reason="settle style allows one entry per window",
+    )
+    # A new 15m window is a fresh signal after the prior position is closed.
+    await paper._maybe_open_position(
+        _snapshot(window_slug="btc-updown-15m-1781160300")
+    )
     async with paper.connect() as db:
         async with db.execute("SELECT COUNT(*) AS n FROM paper_positions") as cur:
             assert (await cur.fetchone())["n"] == 2
@@ -115,6 +125,33 @@ async def test_one_entry_per_window(test_db, monkeypatch: pytest.MonkeyPatch):
             "SELECT strategy_style FROM paper_positions LIMIT 1"
         ) as cur:
             assert (await cur.fetchone())["strategy_style"] == "settle"
+
+
+@pytest.mark.asyncio
+async def test_open_position_guard_is_logged(
+    test_db, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(paper, "_live_executor", None)
+    logger = MagicMock()
+    monkeypatch.setattr(paper, "log", logger)
+    snap = _snapshot()
+
+    await paper._maybe_open_position(snap)
+    await paper._maybe_open_position(
+        _snapshot(window_slug="btc-updown-15m-1781160300")
+    )
+
+    logger.info.assert_any_call(
+        "paper_entry.skipped_open_position",
+        window_slug="btc-updown-15m-1781160300",
+        side="Up",
+        reason="another position is already open",
+    )
+    async with paper.connect() as db:
+        async with db.execute(
+            "SELECT COUNT(*) AS n FROM paper_positions WHERE state = 'open'"
+        ) as cur:
+            assert (await cur.fetchone())["n"] == 1
 
 
 # ---------------------------------------------------------------------------
