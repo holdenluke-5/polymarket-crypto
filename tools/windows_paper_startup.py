@@ -269,22 +269,20 @@ def _dashboard_listener_pids() -> set[int]:
 def _dashboard_log_matches_process(pid: int) -> bool:
     log_path = LOG_ROOT / "dashboard.log"
     try:
-        with log_path.open("rb") as log_file:
-            log_file.seek(0, os.SEEK_END)
-            log_file.seek(max(0, log_file.tell() - 65536))
-            lines = log_file.read().decode("utf-8", errors="replace").splitlines()
+        log_file = log_path.open("r", encoding="utf-8", errors="replace")
     except OSError:
         return False
 
     expected_db_path = str(DATA_ROOT / "btc_5m_binary_fair_value.db").lower()
     latest_boot_uses_install = False
-    for line in lines:
-        lowered = line.lower()
-        if "app.boot" in lowered:
-            latest_boot_uses_install = f"db_path={expected_db_path}" in lowered
-        match = re.search(r"started server process \[(\d+)\]", lowered)
-        if match and int(match.group(1)) == pid and latest_boot_uses_install:
-            return True
+    with log_file:
+        for line in log_file:
+            lowered = line.lower()
+            if "app.boot" in lowered:
+                latest_boot_uses_install = f"db_path={expected_db_path}" in lowered
+            match = re.search(r"started server process \[(\d+)\]", lowered)
+            if match and int(match.group(1)) == pid and latest_boot_uses_install:
+                return True
     return False
 
 

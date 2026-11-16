@@ -125,8 +125,9 @@ def test_dashboard_log_matches_only_its_install_and_listener_pid(
     monkeypatch.setattr(startup, "LOG_ROOT", log_root)
     log_path = log_root / "dashboard.log"
     log_path.write_text(
-        f"app.boot db_path={data_root / 'btc_5m_binary_fair_value.db'}\n"
-        "INFO: Started server process [12345]\n",
+        ("old log entry\n" * 10000)
+        + f"app.boot db_path={data_root / 'btc_5m_binary_fair_value.db'}\n"
+        + "INFO: Started server process [12345]\n",
         encoding="utf-8",
     )
 
