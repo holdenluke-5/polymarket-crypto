@@ -20,11 +20,13 @@ They are **bidirectionally coupled**: the FastAPI dashboard imports `polymarket_
 |---|---|
 | Plug in a **new strategy** (the loop's entry decision) | `polymarket_bot/paper.py:_build_snapshot` — the `NO_STRATEGY_REASON` block |
 | Change virtual paper-wallet accounting | `polymarket_bot/paper_wallet.py` and the paper entry/close paths in `polymarket_bot/paper.py` |
+| Practice balance switch (new starting balance, % kept) | `polymarket_bot/paper_wallet.py` (`rescale`, `scale_for_txn`), `POST /api/simple/wallet` in `polymarket_exec/ops/dashboard/app.py`, scaling in `simple_view.py` |
 | Shared pricing math (fair value, sigma) used by shadow/daily/backtests | `polymarket_bot/strategy.py` (NOT `polymarket_exec/strategy/` — that only feeds backtests) |
 | Risk limits / kill-switch / daily-loss halt | `polymarket_exec/execution/gate.py` |
 | Live order placement | `polymarket_exec/execution/live.py` |
 | Add/modify a market or price feed | `polymarket_exec/connectors/` |
-| Dashboard panel / UI | `polymarket_exec/ops/dashboard/panels/` |
+| Dashboard panel / UI (advanced console at `/advanced`) | `polymarket_exec/ops/dashboard/panels/` |
+| Simple paper screen at `/` (wording, numbers, layout) | `polymarket_exec/ops/dashboard/simple_view.py` (read-only data + plain-English decisions), `templates/simple.html`, `static/simple.{js,css}` |
 | Market regime overview (vol / volume / book feasibility, advisory; feeds a future router) | `polymarket_bot/regime/` — see `docs/REGIME_OVERVIEW.md`; the card is `panels/regime.py` |
 | An env knob / default | `config.py` + document in `.env.example` |
 | A new DB column | `db.py` migration dict (NOT the `SCHEMA` literal) |
@@ -122,6 +124,9 @@ Env knobs: `BTC_TRADE_*` are canonical; `BTC_LIVE_*` are deprecated read-aliases
 | `polymarket_bot/regime/sources.py` | WIRED | 1 | I/O fetchers for the regime monitor: Binance spot klines, Gamma markets, tick book. |
 | `polymarket_bot/regime/types.py` | WIRED | 5 | Shared data contracts for the market regime overview. |
 | `polymarket_bot/runtime_knobs.py` | WIRED | 8 | Operator runtime knobs: single dashboard-editable source of truth (#206). |
+| `polymarket_bot/learning.py` | WIRED | 3 | Learned chances: hourly holdout-checked blend of the pricing model with the market mid (paper only). |
+| `polymarket_bot/strategy_lab.py` | WIRED | 1 | Strategy Lab replay: settle vs scalp, sizing, one-change variants, half-split grid (read-only). |
+| `polymarket_bot/shadow/learned.py` | WIRED | 1 | Shadow candidates on learned chances (late entries; 60–90¢ shares). |
 | `polymarket_bot/shadow/__init__.py` | pkg | 3 | Shadow forward-tester: candidate strategies logged and settled net of fees. |
 | `polymarket_bot/shadow/fees.py` | WIRED | 6 | Polymarket taker-fee math for the shadow forward-tester. |
 | `polymarket_bot/shadow/ledger.py` | WIRED | 2 | Persistence for the shadow forward-tester's would-be trades. |

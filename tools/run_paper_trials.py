@@ -19,6 +19,12 @@ TEST_FILES = [
     "tests/unit/test_offline_replay.py",
     "tests/unit/test_main_singleton.py",
     "tests/unit/test_windows_paper_startup.py",
+    "tests/unit/test_simple_view.py",
+    "tests/unit/test_paper_settings.py",
+    "tests/unit/test_learning.py",
+    "tests/unit/test_strategy_lab.py",
+    "tests/unit/test_paper_wallet.py",
+    "tests/unit/test_paper_wallet_rescale.py",
 ]
 
 

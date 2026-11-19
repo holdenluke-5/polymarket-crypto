@@ -141,6 +141,9 @@ def _sanitized_environment() -> dict[str, str]:
             "DB_PATH": str(DATA_ROOT / "btc_5m_binary_fair_value.db"),
             "DASHBOARD_SERVER_NAME": "127.0.0.1",
             "DASHBOARD_SERVER_PORT": str(PORT),
+            # Lets the app restart itself after an update, only when no trade is
+            # open (polymarket_exec/ops/dashboard/self_restart.py).
+            "PAPER_SELF_RESTART": "1",
         }
     )
     return env
@@ -381,7 +384,46 @@ def _has_current_btc_contract(payload: dict[str, Any], now: int | None = None) -
     return False
 
 
-def _run_service(root: Path) -> None:
+def _edge_path() -> Path | None:
+    for base in (os.environ.get("PROGRAMFILES(X86)"), os.environ.get("PROGRAMFILES"),
+                 os.environ.get("LOCALAPPDATA")):
+        if base:
+            path = Path(base) / "Microsoft" / "Edge" / "Application" / "msedge.exe"
+            if path.is_file():
+                return path
+    return None
+
+
+def _open_app_window() -> None:
+    """Show the dashboard in its own window (Edge app mode: no tabs or address
+    bar, its own taskbar icon); fall back to the default browser."""
+    edge = _edge_path()
+    if edge is not None:
+        try:
+            subprocess.Popen([str(edge), f"--app={URL}/", "--window-size=1280,900"])
+            return
+        except OSError:
+            pass
+    webbrowser.open_new(URL)
+
+
+def _wait_for_exit(pid: int, timeout: float = 60.0) -> None:
+    """Wait for the old app process to end (Windows) before starting a new one."""
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if handle:
+        try:
+            kernel32.WaitForSingleObject(handle, int(timeout * 1000))
+        finally:
+            kernel32.CloseHandle(handle)
+    deadline = time.monotonic() + timeout
+    while _dashboard_data(timeout=1.0) is not None and time.monotonic() < deadline:
+        time.sleep(1)  # port still answering: give the old server a moment
+
+
+def _run_service(root: Path, *, open_window: bool = True) -> None:
     if os.name != "nt":
         raise RuntimeError("The Windows startup task can only run on Windows.")
     _python, _pythonw = _python_paths(root)
@@ -423,7 +465,8 @@ def _run_service(root: Path) -> None:
             f"within 120 seconds; inspect {log_path} for details."
         )
 
-    webbrowser.open_new(URL)
+    if open_window:
+        _open_app_window()
     print(f"Paper BTC dashboard is running at {URL}. Logs: {log_path}")
 
 
@@ -490,12 +533,21 @@ def uninstall() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("install", "run", "uninstall"))
-    action = parser.parse_args().action
+    parser.add_argument("action", choices=("install", "run", "restart", "uninstall"))
+    parser.add_argument("--after-pid", type=int, default=None,
+                        help="restart: wait for this app process to exit first")
+    args = parser.parse_args()
+    action = args.action
     if action == "install":
         install()
     elif action == "run":
         _run_service(REPOSITORY_ROOT)
+    elif action == "restart":
+        # Started by the app itself after an update (self_restart.py): no new window.
+        if args.after_pid:
+            _wait_for_exit(args.after_pid)
+        time.sleep(2)
+        _run_service(REPOSITORY_ROOT, open_window=False)
     else:
         uninstall()
 

@@ -129,7 +129,7 @@ class TestMarketSelection:
             assert r.json()["status"] == "error"
 
     def test_page_renders_selector(self, client: TestClient) -> None:
-        html = client.get("/").text
+        html = client.get("/advanced").text
         assert "id=\"market-selector\"" in html
         assert "data-asset='eth'" in html
         assert "data-timeframe='1h'" in html

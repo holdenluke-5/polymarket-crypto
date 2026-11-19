@@ -66,6 +66,8 @@ from polymarket_exec.execution.gate import (
     RiskGate,
     build_gate_from_config,
 )
+from polymarket_bot.shadow.fees import DEFAULT_TAKER_FEE_RATE as PAPER_TAKER_FEE_RATE
+from polymarket_bot import learning as _learning
 from polymarket_bot.shadow import ledger as shadow_ledger
 from polymarket_bot.shadow import runner as shadow_runner
 from polymarket_bot.strategy import (
@@ -146,9 +148,31 @@ def _strategy_params() -> StrategyParams:
     max_trade_usd = (
         override if override is not None else _knobs.cached("paper_max_trade_usd")
     )
+    # Entry rules are runtime knobs (defaults = the env config values), so the
+    # simple screen's Settings panel changes them on the next tick, no restart.
     return StrategyParams(
         min_trade_usd=_knobs.cached("paper_min_trade_usd"),
         max_trade_usd=max_trade_usd,
+        entry_edge_min=float(_knobs.cached("paper_entry_edge_min")),
+        min_confidence=_config.PAPER_MIN_CONFIDENCE,
+        entry_min_remaining_seconds=int(_knobs.cached("paper_entry_min_remaining_seconds")),
+        entry_edge_max=float(_knobs.cached("paper_entry_edge_max")),
+        min_entry_price=float(_knobs.cached("paper_min_entry_price")),
+        max_entry_price=float(_knobs.cached("paper_max_entry_price")),
+        fee_rate=PAPER_TAKER_FEE_RATE if _knobs.cached("paper_fee_aware") else 0.0,
+    )
+
+
+def _shadow_params() -> StrategyParams:
+    """Frozen entry rules for the shadow roster.
+
+    Each candidate races on ONE spec, so the roster reads the env config
+    values, never the simple screen's Settings knobs (which _strategy_params
+    follows). Only the twins in shadow_runner.LIVE_RULE_MODELS get live rules.
+    """
+    return StrategyParams(
+        min_trade_usd=_knobs.cached("paper_min_trade_usd"),
+        max_trade_usd=_knobs.cached("paper_max_trade_usd"),
         entry_edge_min=_config.PAPER_ENTRY_EDGE_MIN,
         min_confidence=_config.PAPER_MIN_CONFIDENCE,
         entry_min_remaining_seconds=_config.PAPER_ENTRY_MIN_REMAINING_SECONDS,
@@ -230,6 +254,11 @@ class PaperSnapshot:
     # table — and defaults to 0.0 (neutral regime) so historical replays and
     # the many existing constructors are unaffected.
     drift_per_second: float = 0.0
+    # Learned Up chance (polymarket_bot/learning.py) the PAPER entry decision
+    # used this tick, or None when learning was off/inactive. fair_up_prob stays
+    # the raw pricing model so the journal, the shadow roster and the replay
+    # tools keep one meaning for it.
+    decision_up_prob: float | None = None
 
     @property
     def has_executable_quote(self) -> bool:
@@ -426,6 +455,10 @@ async def run_paper_loop(stop_event: threading.Event, mode: str | None = None) -
     else:
         await _set_detail("BTC paper loop running. No real orders will be placed.")
         await notify("paper_started", "BTC paper bot started")
+        try:
+            await _learning.load_saved()
+        except Exception as e:  # noqa: BLE001 — learning must never block the loop
+            log.warning("learning.load_failed", error=str(e))
     log.info("paper_loop.started", mode=mode)
 
     # Set when the daily loss halt trips (#76): the loop stops the bot and the
@@ -451,6 +484,11 @@ async def run_paper_loop(stop_event: threading.Event, mode: str | None = None) -
             # Paper breach (#146): entries pause, the loop and the shadow
             # race keep running — notify once per episode.
             await _notify_paper_halt_pause(_risk_gate, mode)
+            if _live_executor is None:
+                try:
+                    _learning.schedule_refit()
+                except Exception as e:  # noqa: BLE001 — never break the loop
+                    log.warning("learning.schedule_failed", error=str(e))
             _beat()  # #147: iteration completed (even a failed tick beats)
             await _sleep_interruptible(stop_event, float(_knobs.cached('paper_tick_seconds')))
     finally:
@@ -890,6 +928,12 @@ async def _build_snapshot(
         )
     else:
         fair_up = 0.5
+    # Learned chances (paper only): the raw model blended with the market's own
+    # prices, once a fit has beaten the raw model on held-out windows.
+    learned_up: float | None = None
+    if degraded_reason is None and allow_paper_strategy and _knobs.cached("paper_learning"):
+        learned_up = _learning.adjust(fair_up, up_book.best_ask, down_book.best_ask)
+    decision_up = learned_up if learned_up is not None else fair_up
 
     # Edge against the EXECUTABLE price: a BUY of side X pays X's best ask.
     # A degraded feed pins fair_up at 0.5, so any "edge" against a lopsided
@@ -897,8 +941,8 @@ async def _build_snapshot(
     # Journaled as market observations for the dashboard and the shadow
     # roster; nothing on the trading path acts on them.
     if degraded_reason is None:
-        edge_up = fair_up - up_book.best_ask if up_book.buyable else None
-        edge_down = (1.0 - fair_up) - down_book.best_ask if down_book.buyable else None
+        edge_up = decision_up - up_book.best_ask if up_book.buyable else None
+        edge_down = (1.0 - decision_up) - down_book.best_ask if down_book.buyable else None
     else:
         edge_up = edge_down = None
 
@@ -967,6 +1011,7 @@ async def _build_snapshot(
         quote_source="clob",
         gamma_up_price=gamma_up_price,
         feed_degraded=degraded_reason is not None,
+        decision_up_prob=learned_up,
     )
 
 
@@ -1206,9 +1251,9 @@ async def _log_tick(snapshot: PaperSnapshot) -> None:
               notional_usd, feed_source, reason,
               up_best_bid, up_best_ask, up_bid_size, up_ask_size,
               down_best_bid, down_best_ask, down_bid_size, down_ask_size,
-              quote_source, gamma_up_price
+              quote_source, gamma_up_price, learned_up_prob
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot.created_at,
@@ -1237,6 +1282,7 @@ async def _log_tick(snapshot: PaperSnapshot) -> None:
                 snapshot.down_ask_size,
                 snapshot.quote_source,
                 snapshot.gamma_up_price,
+                snapshot.decision_up_prob,
             ),
         )
         await db.commit()
@@ -1693,8 +1739,9 @@ async def _record_and_settle_shadow(
     if _config.SHADOW_ENABLED != "on":
         return
     try:
-        params = _strategy_params()
-        await shadow_runner.record_shadow(snapshot, params)
+        await shadow_runner.record_shadow(
+            snapshot, _shadow_params(), live_params=_strategy_params()
+        )
         await _settle_due_shadows(client, snapshot.window_slug)
     except Exception as exc:  # noqa: BLE001 — never let the harness break the loop
         log.warning("shadow.harness_error", error=str(exc))
@@ -1902,7 +1949,7 @@ def _exit_reason(snapshot: PaperSnapshot, pos: dict[str, Any], exit_price: float
     if (
         not snapshot.feed_degraded
         and snapshot.has_executable_quote
-        and abs(snapshot.edge) < _config.PAPER_ENTRY_EDGE_MIN / 2
+        and abs(snapshot.edge) < float(_knobs.cached("paper_entry_edge_min")) / 2
     ):
         return "BAND_REENTRY"
     return None
@@ -1931,8 +1978,9 @@ def _detail_from_snapshot(snapshot: PaperSnapshot) -> str:
     return header + (
         f"Window: {snapshot.window_slug} ({snapshot.remaining_seconds}s left)\n"
         f"Spot: ${snapshot.spot_price:,.2f} vs ref ${snapshot.reference_price:,.2f}\n"
-        f"Polymarket Up: {up_price}; fair Up: {snapshot.fair_up_prob:.3f}; "
-        f"edge: {snapshot.edge:+.3f}\n"
+        f"Polymarket Up: {up_price}; fair Up: {snapshot.fair_up_prob:.3f}"
+        + (f" (learned {snapshot.decision_up_prob:.3f})" if snapshot.decision_up_prob is not None else "")
+        + f"; edge: {snapshot.edge:+.3f}\n"
         f"Signal: {side}; confidence {snapshot.confidence:.2f}; notional ${snapshot.notional_usd:.0f}\n"
         f"Gate: {_gate_preview_line(snapshot)}\n"
         f"{_feed_label(snapshot.feed_source)}"

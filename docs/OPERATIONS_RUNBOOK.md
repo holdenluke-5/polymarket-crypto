@@ -18,6 +18,101 @@ Open:
 http://127.0.0.1:7860
 ```
 
+That address opens the **simple paper screen**: practice balance, Start/Stop,
+the 5 min / 15 min choice, the current Up/Down window with the price to beat,
+one plain-English line saying what the bot is doing and why, the open trade,
+a balance chart, and the trade history. It also shows what the same trades
+would have paid in estimated taker fees, because the paper ledger itself is
+fee-free. The page is paper-only by construction: it is served without the
+dashboard token, so it cannot select or start LIVE.
+
+Below the trade history, **How accurate is the bot?** compares the chance the
+bot gave each settled trade with how often those trades actually won, next to
+the price paid and the profit after estimated fees. A bot with a real edge
+wins more often than the price it pays.
+
+**What it has learned** reports the learned-chances fit
+(`polymarket_bot/learning.py`). Every hour, in a worker thread, the paper loop
+refits `learned = sigmoid(a*logit(model) + b*logit(market mid))` from the tick
+journal (ticks with more than 60 s left, every window weighted once, outcomes
+from the next window's reference print, known shadow outcomes winning). Since
+2026-11-19 the fit is used for paper entries while, replayed with the current
+Settings over past windows (`strategy_lab.compare_learning`: walk-forward
+fits, 5 shares, after fees), learned chances made more money than the raw
+model; if that replay can't run it falls back to the old check (beat the raw
+model's Brier score on the newest 20% of windows). Otherwise the bot trades on
+the raw model. The fit is stored under `learning.blend_v1` in `config`, the
+first active fit's time under `learning.started_at`, and each tick's learned
+chance in `paper_ticks.learned_up_prob` (`fair_up_prob` stays the raw model).
+*Use learned chances* in Settings switches it off. Live mode never uses it.
+
+**Strategies tested side by side** compares this bot (counted from when
+learning started) with the shadow roster, fee-true. The roster now always
+uses its frozen config rules (`paper._shadow_params`), never the Settings
+knobs, except `bot_raw_twin_v1`: the same live Settings rules on the raw
+model, so the gap to this bot shows what learning adds. `learned_late_v1`
+(60–180 s left) and `learned_mid_v1` (60–90¢ shares) are fixed-spec patterns
+from the 2026-11-16..18 replay, judged only on windows after they started.
+A verdict needs 50 settled trades and uses a strict z = 2.85 band because
+about eleven strategies are compared at once; nothing switches automatically.
+
+Since 2026-11-19: trade size on the simple screen is **shares only**. A dollar
+range is refused (400): the RiskGate's per-trade cap stays at its $3 env
+default for dollar sizing, so a $20–$100 range blocked every entry for 16 h
+on 2026-11-18 (238 `per-trade cap` blocks), while N shares raise the cap to N
+(`gate.effective_max_trade_usd`). The screen shows a banner when 3+ entries
+were blocked in the last hour (`entry_blocks` in `/api/simple`, plain-English
+reason). Learned shadow candidates now use the latest fit even when the main
+bot has not adopted it, and two Strategy Lab grid hypotheses run as fixed
+shadows: `raw_wide_v1` (raw, fee check, edge 3¢+, no cap) and
+`learned_wide_v1` (learned, edge 3¢+, no cap).
+
+Settings chosen from the data on 2026-11-18 evening (Luke asked for the best
+parameters by the measured data): 5 shares, hold to settle, fee check on,
+minimum edge 3¢ after fees, skip edges above 20¢ (kept as a bad-data guard),
+share prices 50–95¢, no new trades in the last 60 s, learned chances on. On
+387 replayed windows that combination made money in all four blocks (+$42.50,
+171 trades, worst losing streak $14.56) vs −$54.20 and a $90 streak for the
+previous rules; still within luck, so the forward record decides.
+
+At 8:06 PM MT the same evening Luke asked for the Strategy Lab's most
+profitable choices: minimum edge 2¢, edge limit 50¢ (no recorded trade had a
+bigger edge, so this equals the Lab's "no limit" while keeping the
+stale-model guard) and 10 shares a trade; the other rules were already the
+Lab's picks. He then switched the practice balance from $100 to $500 (see
+*Paper Trading* below). The strategies table counts every row at 5 shares a
+trade, so this bot's 10-share trades are halved there to compare fairly with
+the 5-share shadows. At 10 shares a full day of trading spends about $1,000,
+close to the RiskGate's daily bankroll cap (`runtime.live.bankroll_cap_usd`,
+$999), so on busy days late entries before the 00:00 UTC reset can show as
+`daily bankroll cap` blocks.
+
+The **Strategy Lab** (`/lab`, link in the footer) replays the recorded
+history with `polymarket_bot/strategy_lab.py`: settle vs scalp (bid exits, a
+second fee), trade sizes (drawdown, fills capped by top-of-book size), one
+rule change at a time, and a 576-combination grid picked on the older half and
+judged on the newer half. Read-only, cached 15 minutes (`/api/lab?refresh=true`).
+Sizes are judged against the real practice balance (cash plus any open trade
+at cost, `balance_usd` in `/api/lab`).
+
+**Settings** (top bar, or the *Trading settings* section) edits the paper
+rules without a restart: trade size (a fixed share count, or a dollar range
+scaled by confidence), minimum edge, the stale-data edge limit, the share-price
+range, the no-new-trades cutoff before a window ends, the check interval, and
+an optional *Edge must beat trading fees* rule (off by default; subtracts the
+estimated taker fee before the minimum-edge test). Every value is validated
+before anything is saved; changes apply on the bot's next check and are logged
+to the activity feed. *Reset rules to defaults* restores the rules but keeps
+the trade size. The panel is refused while real-money mode is selected. The
+rules are runtime knobs (`runtime.paper.*` in the `config` table), so the
+advanced console shows the same values.
+
+The full operator console (all panels, settings, LIVE controls) moved to:
+
+```text
+http://127.0.0.1:7860/advanced
+```
+
 ## Paper Trading
 
 - Press **▶ Start** to begin the BTC 5m or 15m paper loop (paper is the default mode).
@@ -29,7 +124,7 @@ http://127.0.0.1:7860
 - Press **Stop** to halt new paper entries and force-close open simulated
   positions.
 - Use **Refresh** if you want an immediate dashboard update between timer ticks.
-- Paper mode has a separate **$100 virtual wallet**, initialized once in the
+- Paper mode has a separate **virtual wallet** ($100 at first), initialized once in the
   local SQLite database. Simulated buys debit their entry cost; sells and
   settlements credit simulated proceeds. The `Paper Equity` ribbon shows
   virtual cash plus open-position value, marked at the current contract bid
@@ -38,6 +133,39 @@ http://127.0.0.1:7860
   refilled. There is no dashboard reset control; resetting it requires a
   deliberate local database reset, which also removes the associated paper
   history. It is not connected to a Polymarket account or real funds.
+- **Practice balance switch** (`POST /api/simple/wallet` with
+  `{"start_usd": 500}`, paper mode only, on the operator's request): sets a
+  new starting balance and multiplies the balance (cash plus any open trade at
+  cost) by new start / old start, so the percentage gain or loss carries over.
+  It is logged to Recent activity and stored in `config`
+  `paper.wallet_rescales` with the last wallet transaction id before the
+  switch. The simple screen counts every earlier trade at the same factor in
+  the balance chart, totals, fee estimate and accuracy profits; the trade list
+  shows trades as they happened with a marker row at the switch. An open trade
+  keeps its real size. An optional `"as_of"` (ISO time, at most 24 h back)
+  makes the switch count from when it was asked for: trades booked between
+  then and the restart that installed the switch count at their real size,
+  and their balances are shifted up by the switch amount on the chart. Luke
+  asked for $100 → $500 at 8:12 PM MT on 2026-11-18, so trades before then
+  count 5×. This is not a refill: a loss scales up just like a gain.
+
+## Updates without a manual restart
+
+When the app is started by `tools/windows_paper_startup.py` (desktop shortcut or
+logon task), it sets `PAPER_SELF_RESTART=1` and the dashboard watches its own
+Python files (`polymarket_exec/ops/dashboard/self_restart.py`). After a change
+has been still for 20 s, every changed file compiles, the mode is paper and no
+paper trade is open, it logs "Restarting to load an update" to Recent activity,
+starts `windows_paper_startup.py restart --after-pid <pid>` and exits (the same
+as ending Python in Task Manager, timed for a flat moment). The launcher waits
+for the old process, then starts the app again in paper mode without opening a
+window. A file that fails to compile blocks the restart and is reported in
+Recent activity; real-money mode is never restarted. Page files (templates,
+JS, CSS) and Settings never needed a restart.
+
+The launcher opens the dashboard in its own window (Microsoft Edge app mode:
+no tabs or address bar), falling back to the default browser if Edge is
+missing.
 
 ## Repeatable Trial Checks
 

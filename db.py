@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS paper_ticks (
   down_bid_size REAL,
   down_ask_size REAL,
   quote_source TEXT,
-  gamma_up_price REAL
+  gamma_up_price REAL,
+  learned_up_prob REAL
 );
 CREATE INDEX IF NOT EXISTS idx_paper_ticks_created
   ON paper_ticks(created_at DESC);
@@ -305,6 +306,7 @@ TICK_COLUMN_MIGRATIONS = {
     "down_ask_size": "REAL",
     "quote_source": "TEXT",
     "gamma_up_price": "REAL",
+    "learned_up_prob": "REAL",
 }
 
 

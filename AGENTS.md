@@ -164,7 +164,8 @@ This boots the **FastAPI dashboard** (uvicorn serving
 Dashboard:
 
 ```text
-http://127.0.0.1:7860
+http://127.0.0.1:7860            simple paper screen (paper-only; served without the LIVE token)
+http://127.0.0.1:7860/advanced   full operator console (all panels, settings, LIVE controls)
 ```
 
 Optional snapshot:
