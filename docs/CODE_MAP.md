@@ -81,19 +81,19 @@ Env knobs: `BTC_TRADE_*` are canonical; `BTC_LIVE_*` are deprecated read-aliases
 <!-- BEGIN GENERATED:summary -->
 - **Trees:** `polymarket_bot/` = live loop + signal math; `polymarket_exec/` = execution/connectors/dashboard/backtest; top-level `config.py`/`db.py`/`logging_setup.py` = foundation. Both ACTIVE, bidirectionally coupled.
 - **Entry:** `python main.py` → FastAPI `polymarket_exec/ops/dashboard/app.py`; loop starts on operator ▶ Start → `polymarket_bot/controller.py:request_start`.
-- **Tests:** 1133.
+- **Tests:** 1222.
 - **Built-but-dead (do not edit expecting runtime effect):** `polymarket_bot/chronos_signal.py`, `polymarket_exec/backtest/conditional.py`, `polymarket_exec/backtest/harness.py`, `polymarket_exec/connectors/base.py`, `polymarket_exec/connectors/binance.py`, `polymarket_exec/connectors/chainlink.py`, `polymarket_exec/connectors/polymarket.py`, `polymarket_exec/ops/controller.py`, `polymarket_exec/ops/dashboard/panels/_shared.py`, `polymarket_exec/storage/replay.py`, `polymarket_exec/strategy/signal.py`.
 <!-- END GENERATED:summary -->
 
 <!-- BEGIN GENERATED:inventory -->
 | Module | Status | Importers | Role |
 |---|---|---|---|
-| `config.py` | WIRED | 28 | Configuration for the local Polymarket crypto trading lab. |
+| `config.py` | WIRED | 30 | Configuration for the local Polymarket crypto trading lab. |
 | `dashboard.py` | WIRED | 1 | Local Gradio dashboard for BTC 5-minute paper trading. |
-| `db.py` | WIRED | 17 | SQLite storage for the local Polymarket crypto trading lab. |
-| `logging_setup.py` | WIRED | 12 | Structured JSON logging with structlog. Module + trade_id context. |
+| `db.py` | WIRED | 20 | SQLite storage for the local Polymarket crypto trading lab. |
+| `logging_setup.py` | WIRED | 13 | Structured JSON logging with structlog. Module + trade_id context. |
 | `main.py` | cli | 0 | Entrypoint for the BTC 5-minute paper trading system. |
-| `polymarket_bot/__init__.py` | pkg | 12 | BTC 5-minute paper-trading package. |
+| `polymarket_bot/__init__.py` | pkg | 16 | BTC 5-minute paper-trading package. |
 | `polymarket_bot/backtest.py` | WIRED | 4 | Backtest and optimize the BTC 5-minute binary strategy on local history. |
 | `polymarket_bot/chronos_signal.py` | DEAD? | 0 | Layer 3 — Chronos time-series ensemble (stub). |
 | `polymarket_bot/controller.py` | WIRED | 2 | Start/stop controller for the BTC 5-minute trader (paper default, live opt-in). |
@@ -104,6 +104,7 @@ Env knobs: `BTC_TRADE_*` are canonical; `BTC_LIVE_*` are deprecated read-aliases
 | `polymarket_bot/daily/signal.py` | WIRED | 1 | Fair-value scoring for the daily altcoin scanner. |
 | `polymarket_bot/daily/types.py` | WIRED | 3 | Shared data contracts for the daily altcoin scanner. |
 | `polymarket_bot/history.py` | WIRED | 3 | Load the user's exported Polymarket history for BTC sizing context. |
+| `polymarket_bot/learning.py` | WIRED | 4 | Learned chances: the paper bot corrects its own chances from its results. |
 | `polymarket_bot/market_selection.py` | WIRED | 6 | Operator market selection: which crypto asset + window timeframe to trade. |
 | `polymarket_bot/pairarb/__init__.py` | pkg | 1 | Two-sided maker quoting on 5-minute Up/Down markets — shadow only (#182). |
 | `polymarket_bot/pairarb/feed.py` | WIRED | 1 | Fill feed for the copier — one interface, two transports (#182). |
@@ -115,7 +116,7 @@ Env knobs: `BTC_TRADE_*` are canonical; `BTC_LIVE_*` are deprecated read-aliases
 | `polymarket_bot/pairarb/quoter.py` | WIRED | 1 | Two-sided quote placement for the 5m Up/Down pair strategy (#182). |
 | `polymarket_bot/pairarb/types.py` | WIRED | 3 | Shared data contracts for the two-sided pair quoter (#182). |
 | `polymarket_bot/paper.py` | WIRED | 5 | BTC 5-minute trading engine (paper by default, live opt-in). |
-| `polymarket_bot/paper_wallet.py` | WIRED | 1 | Persistent simulated cash ledger for BTC paper trades. |
+| `polymarket_bot/paper_wallet.py` | WIRED | 3 | Persistent simulated cash ledger for BTC paper trades. |
 | `polymarket_bot/regime/__init__.py` | pkg | 2 | Market regime overview: volatility, volume, move, jumps, book, session — advisory only. |
 | `polymarket_bot/regime/classify.py` | WIRED | 2 | A-priori regime bands and the advisory strategy-feasibility table. |
 | `polymarket_bot/regime/features.py` | WIRED | 3 | Pure regime feature math over :class:`~polymarket_bot.regime.types.Bar` lists. |
@@ -123,17 +124,16 @@ Env knobs: `BTC_TRADE_*` are canonical; `BTC_LIVE_*` are deprecated read-aliases
 | `polymarket_bot/regime/monitor.py` | WIRED | 1 | The regime monitor's scan loop: fetch → features → bands → fits → journal. |
 | `polymarket_bot/regime/sources.py` | WIRED | 1 | I/O fetchers for the regime monitor: Binance spot klines, Gamma markets, tick book. |
 | `polymarket_bot/regime/types.py` | WIRED | 5 | Shared data contracts for the market regime overview. |
-| `polymarket_bot/runtime_knobs.py` | WIRED | 8 | Operator runtime knobs: single dashboard-editable source of truth (#206). |
-| `polymarket_bot/learning.py` | WIRED | 3 | Learned chances: hourly holdout-checked blend of the pricing model with the market mid (paper only). |
-| `polymarket_bot/strategy_lab.py` | WIRED | 1 | Strategy Lab replay: settle vs scalp, sizing, one-change variants, half-split grid (read-only). |
-| `polymarket_bot/shadow/learned.py` | WIRED | 1 | Shadow candidates on learned chances (late entries; 60–90¢ shares). |
+| `polymarket_bot/runtime_knobs.py` | WIRED | 9 | Operator runtime knobs: single dashboard-editable source of truth (#206). |
 | `polymarket_bot/shadow/__init__.py` | pkg | 3 | Shadow forward-tester: candidate strategies logged and settled net of fees. |
-| `polymarket_bot/shadow/fees.py` | WIRED | 6 | Polymarket taker-fee math for the shadow forward-tester. |
+| `polymarket_bot/shadow/fees.py` | WIRED | 11 | Polymarket taker-fee math for the shadow forward-tester. |
+| `polymarket_bot/shadow/learned.py` | WIRED | 1 | Shadow candidates that trade on the bot's learned chances (paper only). |
 | `polymarket_bot/shadow/ledger.py` | WIRED | 2 | Persistence for the shadow forward-tester's would-be trades. |
 | `polymarket_bot/shadow/runner.py` | WIRED | 2 | Shadow forward-tester runner. |
 | `polymarket_bot/shadow/signals.py` | WIRED | 2 | Candidate strategies for the shadow forward-tester. |
-| `polymarket_bot/shadow/types.py` | WIRED | 3 | Shared data contracts for the shadow forward-tester. |
-| `polymarket_bot/strategy.py` | WIRED | 8 | Shared BTC 5-minute binary strategy math. |
+| `polymarket_bot/shadow/types.py` | WIRED | 4 | Shared data contracts for the shadow forward-tester. |
+| `polymarket_bot/strategy.py` | WIRED | 11 | Shared BTC 5-minute binary strategy math. |
+| `polymarket_bot/strategy_lab.py` | WIRED | 2 | Strategy Lab: replay the paper bot's recorded history under other rules. |
 | `polymarket_exec/__init__.py` | pkg | 0 | BTC 5m Binary Pricing Model trading system. |
 | `polymarket_exec/backtest/__init__.py` | pkg | 0 | Backtesting harness and metrics. |
 | `polymarket_exec/backtest/conditional.py` | DEAD? | 0 | Conditional backtest — evaluates strategy on historical user trades. |
@@ -157,7 +157,7 @@ Env knobs: `BTC_TRADE_*` are canonical; `BTC_LIVE_*` are deprecated read-aliases
 | `polymarket_exec/execution/risk.py` | WIRED | 1 | Venue-independent risk service — pre-trade and post-trade risk controls. |
 | `polymarket_exec/ops/__init__.py` | pkg | 0 | Operator controls and telemetry. |
 | `polymarket_exec/ops/controller.py` | DEAD? | 0 | Unified bot controller — tick loop using execution manager + risk service. |
-| `polymarket_exec/ops/dashboard/__init__.py` | pkg | 0 | FastAPI dashboard for BTC 5m Binary Pricing Model trading system. |
+| `polymarket_exec/ops/dashboard/__init__.py` | pkg | 1 | FastAPI dashboard for BTC 5m Binary Pricing Model trading system. |
 | `polymarket_exec/ops/dashboard/app.py` | WIRED | 2 | FastAPI dashboard for the local Polymarket crypto trading lab. |
 | `polymarket_exec/ops/dashboard/execution_view.py` | WIRED | 1 | Execution view orchestrator (#37). |
 | `polymarket_exec/ops/dashboard/panels/__init__.py` | pkg | 2 | Dashboard panels. |
@@ -175,6 +175,8 @@ Env knobs: `BTC_TRADE_*` are canonical; `BTC_LIVE_*` are deprecated read-aliases
 | `polymarket_exec/ops/dashboard/panels/ribbon.py` | WIRED | 1 | Top status ribbon: wallet, P&L, open-position (live) P&L, loss-halt control, |
 | `polymarket_exec/ops/dashboard/panels/settings.py` | WIRED | 1 | Settings panel: every dashboard-editable runtime knob (#206). |
 | `polymarket_exec/ops/dashboard/panels/tca.py` | WIRED | 1 | TCA panel: quoted spread, half-spread, edge capture, Brier calibration. |
+| `polymarket_exec/ops/dashboard/self_restart.py` | WIRED | 1 | Restart the local paper app by itself after its code changes on disk. |
+| `polymarket_exec/ops/dashboard/simple_view.py` | WIRED | 1 | Data for the simple paper-trading screen (``GET /`` and ``GET /api/simple``). |
 | `polymarket_exec/ops/incidents.py` | WIRED | 1 | Incident state machine and operator runbooks for the BTC 5m pricing-model system. |
 | `polymarket_exec/ops/telemetry.py` | WIRED | 1 | Feed health telemetry and latency tracking for the BTC 5m pricing-model system. |
 | `polymarket_exec/storage/__init__.py` | pkg | 0 | Persistence layer — database, recording, and replay. |

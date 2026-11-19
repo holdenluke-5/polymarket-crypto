@@ -164,23 +164,35 @@ async def ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 async def _add_trade(
     conn, start: int, side: str, shares: float, entry: float,
     exit_type: str | None, payout: float | None, exit_price: float | None = None,
+    *, fees: bool = True, slug: str | None = None,
 ) -> int:
-    slug = f"btc-updown-5m-{start}"
+    """A wallet trade as the bot books it: the taker fee on the buy and on a
+    sale (``fees=False``: a trade from before the wallet paid fees)."""
+    slug = slug or f"btc-updown-5m-{start}"
+    if exit_type == "SETTLEMENT" and exit_price is None:
+        exit_price = 1.0 if payout else 0.0
+    buy_fee = paper_wallet.taker_fee(entry, shares) if fees else 0.0
+    sell_fee = paper_wallet.taker_fee(exit_price, shares) if fees and exit_type == "SELL" else 0.0
+    gross = None if exit_type is None else payout - shares * entry
     cur = await conn.execute(
         "INSERT INTO paper_positions(opened_at, closed_at, window_slug, side, state, entry_price,"
-        " exit_price, notional_usd, shares, quote_source, strategy_style, mode)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        " exit_price, notional_usd, shares, quote_source, strategy_style, mode, realized_pnl_usd,"
+        " fees_usd) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (_iso(start + 40), None if exit_type is None else _iso(start + 305), slug, side,
          "open" if exit_type is None else "closed", entry, exit_price, shares * entry, shares,
-         "clob", "settle", "paper"),
+         "clob", "settle", "paper",
+         None if gross is None else gross - buy_fee - sell_fee,
+         (buy_fee + sell_fee) if fees else None),
     )
     pid = cur.lastrowid
     await paper_wallet.apply_cash_flow(
-        conn, position_id=pid, window_slug=slug, transaction_type="BUY", amount_usd=shares * entry
+        conn, position_id=pid, window_slug=slug, transaction_type="BUY",
+        amount_usd=shares * entry, fee_usd=buy_fee,
     )
     if exit_type is not None:
         await paper_wallet.apply_cash_flow(
-            conn, position_id=pid, window_slug=slug, transaction_type=exit_type, amount_usd=payout
+            conn, position_id=pid, window_slug=slug, transaction_type=exit_type,
+            amount_usd=payout, fee_usd=sell_fee,
         )
     return pid
 
@@ -213,18 +225,116 @@ async def test_ledger_totals_curve_and_open_trade(ledger) -> None:
         selection=SELECTION, rules=RULES,
     )
     wallet = p["wallet"]
-    assert wallet["cash_usd"] == pytest.approx(97.27)
+    # Every figure is after fees: $0.8094 paid on five buys and one sale.
+    assert wallet["cash_usd"] == pytest.approx(96.4606)
     assert wallet["open_value_usd"] == pytest.approx(7 * 0.55)
-    assert wallet["equity_usd"] == pytest.approx(97.27 + 3.85)
+    assert wallet["equity_usd"] == pytest.approx(96.4606 + 3.85)
+    assert wallet["fees_paid_usd"] == pytest.approx(0.8094)
     stats = p["stats"]
     assert (stats["trades"], stats["wins"], stats["losses"]) == (4, 2, 2)
-    assert stats["total_pnl_usd"] == pytest.approx(0.98)
-    assert stats["est_fees_usd"] == pytest.approx(0.6873, abs=1e-3)
+    assert stats["total_pnl_usd"] == pytest.approx(0.98 - 0.6873)
+    assert stats["gross_pnl_usd"] == pytest.approx(0.98)
+    assert stats["fees_usd"] == pytest.approx(0.6873)
+    assert "est_fees_usd" not in stats  # an older page would subtract fees twice
     assert [t["result"] for t in p["trades"]] == ["open", "won", "sold", "lost", "won"]
+    sold = p["trades"][2]
+    assert sold["fee_usd"] == pytest.approx(0.1319 + 0.1364)
+    assert sold["pnl_usd"] == pytest.approx(4.64 - 4.96 - 0.1319 - 0.1364)
     # Start, each finished trade (cash after exit), then "now" = the balance on screen.
-    assert [round(pt["v"], 2) for pt in p["curve"]] == [100.0, 104.5, 99.5, 99.18, 100.98, 101.12]
+    assert [round(pt["v"], 2) for pt in p["curve"]] == [100.0, 104.33, 99.17, 98.58, 100.29, 100.31]
     assert p["curve"][-1]["now"] is True
     assert p["decision"]["headline"] == "Holding an Up trade until this window settles."
+    assert p["position"]["fee_usd"] == pytest.approx(0.1221)
+    assert p["position"]["unrealized_usd"] == pytest.approx(7 * 0.55 - 3.71 - 0.1221)
+    assert [q["position_id"] for q in p["positions"]] == [p["position"]["position_id"]]
+
+
+@pytest.mark.asyncio
+async def test_trades_from_before_fees_are_charged_once(ledger, monkeypatch) -> None:
+    """The catch-up: fee-free history pays its fees once, and every view agrees."""
+    now = time.time()
+    start = int(now // 300) * 300
+    async with ledger.connect() as conn:
+        a = await _add_trade(conn, start - 7200, "Up", 10, 0.55, "SETTLEMENT", 10.0, fees=False)
+        b = await _add_trade(conn, start - 3600, "Up", 8, 0.62, "SELL", 4.64,
+                             exit_price=0.58, fees=False)
+        await _add_trade(conn, start, "Up", 7, 0.53, None, None, fees=False)
+        await conn.commit()
+    before = await sv.load_raw()
+    old_curve = [pt["v"] for pt in sv.build_payload(
+        before, now=now, bot={"state": "stopped", "mode": "paper", "detail": ""},
+        selection=SELECTION, rules=RULES)["curve"]]
+
+    event = await paper_wallet.book_past_fees()
+    fees = [0.1733, 0.1319 + 0.1364, 0.1221]  # T1 buy, T2 buy + sale, open buy
+    assert event is not None and event.trades == 3 and event.fills == 4
+    assert event.amount_usd == pytest.approx(sum(fees))
+    assert await paper_wallet.cash_balance() == pytest.approx(event.cash_before_usd - sum(fees))
+    assert await paper_wallet.book_past_fees() is None  # once only
+
+    async with ledger.connect() as conn:
+        async with conn.execute(
+            "SELECT position_id, fees_usd, realized_pnl_usd FROM paper_positions ORDER BY position_id"
+        ) as cur:
+            rows = {r["position_id"]: dict(r) for r in await cur.fetchall()}
+    assert rows[a]["fees_usd"] == pytest.approx(0.1733)
+    assert rows[a]["realized_pnl_usd"] == pytest.approx(4.5 - 0.1733)
+    assert rows[b]["realized_pnl_usd"] == pytest.approx(4.64 - 4.96 - 0.2683)
+
+    p = sv.build_payload(
+        await sv.load_raw(), now=now, bot={"state": "stopped", "mode": "paper", "detail": ""},
+        selection=SELECTION, rules=RULES,
+    )
+    assert p["stats"]["total_pnl_usd"] == pytest.approx(4.5 - 0.32 - 0.1733 - 0.2683)
+    assert p["wallet"]["fees_paid_usd"] == pytest.approx(sum(fees))
+    # The chart is after fees all the way back: each old point minus the fees
+    # paid by then, and no drop where the catch-up was charged.
+    new_curve = [pt["v"] for pt in p["curve"]]
+    assert new_curve[0] == pytest.approx(old_curve[0])
+    assert new_curve[1] == pytest.approx(old_curve[1] - 0.1733)
+    # The open trade's fee was paid after this point (its buy came later).
+    assert new_curve[2] == pytest.approx(old_curve[2] - 0.1733 - 0.2683, abs=1e-4)
+    assert new_curve[-1] == pytest.approx(p["wallet"]["equity_usd"])
+    assert new_curve[-1] == pytest.approx(old_curve[-1] - sum(fees))
+
+    # A trade booked after the catch-up pays its own fee; nothing is charged twice.
+    async with ledger.connect() as conn:
+        await _add_trade(conn, start + 300, "Down", 5, 0.60, None, None,
+                         slug=f"btc-updown-5m-{start + 300}")
+        await conn.commit()
+    assert await paper_wallet.book_past_fees() is None
+
+
+@pytest.mark.asyncio
+async def test_curve_counts_open_trades_at_cost_between_settlements(ledger) -> None:
+    """Three trades in one window settle one row at a time: no dip in between."""
+    now = time.time()
+    start = int(now // 300) * 300 - 600
+    slug = f"btc-updown-5m-{start}"
+    async with ledger.connect() as conn:
+        ids = []
+        for _ in range(3):
+            cur = await conn.execute(
+                "INSERT INTO paper_positions(opened_at, closed_at, window_slug, side, state,"
+                " entry_price, exit_price, notional_usd, shares, quote_source, strategy_style,"
+                " mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (_iso(start + 40), _iso(start + 305), slug, "Up", "closed", 0.6, 1.0, 6.0, 10,
+                 "clob", "settle", "paper"),
+            )
+            ids.append(cur.lastrowid)
+            await paper_wallet.apply_cash_flow(conn, position_id=cur.lastrowid, window_slug=slug,
+                                               transaction_type="BUY", amount_usd=6.0, fee_usd=0.168)
+        for pid in ids:
+            await paper_wallet.apply_cash_flow(conn, position_id=pid, window_slug=slug,
+                                               transaction_type="SETTLEMENT", amount_usd=10.0)
+        await conn.commit()
+    p = sv.build_payload(
+        await sv.load_raw(), now=now, bot={"state": "stopped", "mode": "paper", "detail": ""},
+        selection=SELECTION, rules=RULES,
+    )
+    pts = [round(pt["v"], 3) for pt in p["curve"]]
+    # 100 - 3 fees, with each later winner at cost until it settles.
+    assert pts == [100.0, 103.496, 107.496, 111.496, 111.496]
 
 
 @pytest.mark.asyncio
@@ -289,10 +399,11 @@ def test_routes_serve_simple_page_and_console(
 
 def _settled(price: float, edge: float, won: bool, shares: float = 5.0) -> dict:
     payout = shares if won else 0.0
+    fee = paper_wallet.taker_fee(price, shares)
     return {
         "exit_type": "SETTLEMENT", "entry_price": price, "edge": edge, "shares": shares,
         "exit_price": 1.0 if won else 0.0, "payout_usd": payout,
-        "pnl_usd": payout - shares * price,
+        "fee_usd": fee, "pnl_usd": payout - shares * price - fee,  # the wallet's, after fees
     }
 
 
@@ -377,10 +488,14 @@ def test_strategy_table_counts_fees_and_judges_luck() -> None:
         {"model_id": "learned_mid_v1", "trades": 3, "wins": 2, "avg_price": 0.75,
          "pnl_usd": 0.5, "pnl_sq": 3.0, "first_at": _iso(now - 600)},
     ]
-    closed = [  # this bot: one trade before learning started, two after
-        {"opened_at": _iso(now - 7_200), "shares": 5, "entry_price": 0.70, "pnl_usd": 1.5},
-        {"opened_at": _iso(now - 1_800), "shares": 5, "entry_price": 0.80, "pnl_usd": 1.0},
-        {"opened_at": _iso(now - 900), "shares": 5, "entry_price": 0.60, "pnl_usd": -3.0},
+    f70, f80, f60 = (sv.estimated_fee(5, x) for x in (0.70, 0.80, 0.60))
+    closed = [  # this bot: one trade before learning started, two after (pnl after fees)
+        {"opened_at": _iso(now - 7_200), "shares": 5, "entry_price": 0.70,
+         "pnl_usd": 1.5 - f70, "fee_usd": f70},
+        {"opened_at": _iso(now - 1_800), "shares": 5, "entry_price": 0.80,
+         "pnl_usd": 1.0 - f80, "fee_usd": f80},
+        {"opened_at": _iso(now - 900), "shares": 5, "entry_price": 0.60,
+         "pnl_usd": -3.0 - f60, "fee_usd": f60},
     ]
     rows = {r["id"]: r for r in _payload(
         {"shadows": shadows, "closed": closed, "learning_started": _iso(now - 3_600)},
@@ -392,8 +507,7 @@ def test_strategy_table_counts_fees_and_judges_luck() -> None:
     assert rows["bot_raw_twin_v1"]["trades"] == 0 and rows["bot_raw_twin_v1"]["since_ts"] is None
     main = rows["main"]
     assert main["trades"] == 2 and main["won"] == pytest.approx(0.5)
-    fees = sv.estimated_fee(5, 0.80) + sv.estimated_fee(5, 0.60)
-    assert main["profit_after_fees_usd"] == pytest.approx(-2.0 - fees, abs=1e-4)
+    assert main["profit_after_fees_usd"] == pytest.approx(-2.0 - f80 - f60, abs=1e-4)
 
 
 def test_strategy_table_waits_for_learning_before_counting_this_bot() -> None:
@@ -414,3 +528,94 @@ def test_blocked_entries_are_summarized_in_plain_english() -> None:
     assert _payload({}, now=now)["entry_blocks"] == {"last_hour": 0, "reason": None, "latest_ts": None}
     assert sv.block_reason_plain("daily loss halt: paper realized -10").startswith("today's loss limit")
     assert sv.block_reason_plain("something new") == "something new"
+
+
+# ------------------------------------------------- several open trades
+
+
+def _open_row(pid: int, start: int, now: float, side: str = "Up", age: float = 60.0,
+              slug_start: int | None = None) -> dict:
+    return {
+        "position_id": pid, "opened_at": _iso(now - age),
+        "window_slug": f"btc-updown-5m-{slug_start if slug_start is not None else start}",
+        "side": side, "entry_price": 0.6, "shares": 10.0, "cost_usd": 6.0, "fee_usd": 0.168,
+        "buy_id": pid,
+    }
+
+
+def _many(raw: dict, now: float, *, limit: int = 3, spacing: int = 30, mode: str = "paper") -> dict:
+    base = {
+        "tick": None, "wallet": None, "trades": [], "closed": [], "open_positions": [],
+        "any_open": 0, "curve": [], "activity": [], "window_trades": 0, "blocked": None,
+    }
+    base.update(raw)
+    return sv.build_payload(
+        base, now=now, bot={"state": "running", "mode": mode, "detail": ""}, selection=SELECTION,
+        rules={**RULES, "max_open": limit, "spacing_seconds": spacing, "exit_style": "settle"},
+    )
+
+
+def test_room_for_more_explains_the_market_and_what_is_held() -> None:
+    now = time.time()
+    start = int(now // 300) * 300
+    rows = [_open_row(1, start, now)]
+    p = _many({"tick": _tick(start, now), "open_positions": rows, "any_open": 1,
+               "window_trades": 1}, now)
+    assert p["decision"]["headline"] == "Sitting out: the edge is too small."
+    assert p["decision"]["detail"].startswith(
+        "It holds an Up trade in this window and can add 2 more.")
+    assert len(p["positions"]) == 1
+
+
+def test_waits_between_trades_in_one_window() -> None:
+    now = time.time()
+    start = int(now // 300) * 300
+    tick = _tick(start, now, reason="enter Up: executable edge +0.050 @ ask 0.550")
+    rows = [_open_row(1, start, now, age=12)]  # tick is 2 s old: ~20 s to go
+    p = _many({"tick": tick, "open_positions": rows, "any_open": 1, "window_trades": 1}, now)
+    assert p["decision"]["headline"] == "Holding an Up trade, waiting before another."
+    assert "waits 30 seconds" in p["decision"]["detail"]
+    assert "about 20 seconds to go" in p["decision"]["detail"]
+
+
+def test_holding_the_most_allowed_and_the_window_cap() -> None:
+    now = time.time()
+    start = int(now // 300) * 300
+    rows = [_open_row(3, start, now, "Down", 20), _open_row(2, start, now, "Up", 60),
+            _open_row(1, start, now, "Up", 100)]
+    p = _many({"tick": _tick(start, now), "open_positions": rows, "any_open": 3,
+               "window_trades": 3}, now)
+    assert p["decision"]["headline"] == "Holding 3 trades (2 Up, 1 Down) until this window settles."
+    assert "3 is the most it holds at once" in p["decision"]["detail"]
+    assert [q["position_id"] for q in p["positions"]] == [3, 2, 1]
+    assert p["position"]["position_id"] == 3  # the newest, for the buy banner
+    # A Stop sold them: the window still counts its trades.
+    done = _many({"tick": _tick(start, now), "window_trades": 3}, now)
+    assert done["decision"]["headline"] == "Done with this window."
+    assert "at most 3 trades per window" in done["decision"]["detail"]
+
+
+def test_last_window_still_settling_leaves_room_in_the_new_one() -> None:
+    now = time.time()
+    start = int(now // 300) * 300
+    rows = [_open_row(1, start, now, slug_start=start - 300)]
+    tick = _tick(start, now, reason="enter Down: executable edge +0.050 @ ask 0.450")
+    p = _many({"tick": tick, "open_positions": rows, "any_open": 1}, now)
+    assert p["decision"]["headline"] == "Buying Up now."
+    # One at a time (or real-money mode) waits for the settlement instead.
+    for limit, mode in ((1, "paper"), (3, "live")):
+        one = _many({"tick": tick, "open_positions": rows, "any_open": 1}, now,
+                    limit=limit, mode=mode)
+        assert one["decision"]["headline"] == "Waiting for the last trade to settle."
+        assert one["decision"]["detail"] == "The bot holds one trade at a time."
+
+
+def test_open_trade_value_is_after_its_fee() -> None:
+    now = time.time()
+    start = int(now // 300) * 300
+    p = _many({"tick": _tick(start, now), "open_positions": [_open_row(1, start, now)],
+               "any_open": 1}, now)
+    pos = p["positions"][0]
+    # 10 Up shares marked at the 0.56 bid, bought for $6.00 + 16.8c fee.
+    assert pos["value_usd"] == pytest.approx(5.6)
+    assert pos["unrealized_usd"] == pytest.approx(5.6 - 6.0 - 0.168)

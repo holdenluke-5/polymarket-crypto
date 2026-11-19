@@ -8,8 +8,8 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23172033'/%3E%3Cpath d='M9 14l5-6 5 6z' fill='%234CD4A0'/%3E%3Cpath d='M13 18l5 6 5-6z' fill='%23FF8A80'/%3E%3C/svg%3E">
   {# No dashboard-token meta tag on purpose: this page can never arm LIVE. #}
   {# ".b5": page files can ship without a restart (templates reload live), so bump
-     this suffix to make browsers fetch them at once. #}
-  <link rel="stylesheet" href="/static/simple.css?v={{ static_version }}.b5">
+     this suffix to make browsers fetch them at once. (.b6: several open trades, fees in P&L) #}
+  <link rel="stylesheet" href="/static/simple.css?v={{ static_version }}.b6">
 </head>
 <body>
 <div class="page">
@@ -94,7 +94,7 @@
         <p class="balance-line balance-fees" id="balance-fees"></p>
       </div>
       <div class="open-trade">
-        <h2>Open trade</h2>
+        <h2 id="position-title">Open trade</h2>
         <div id="position"><p class="muted">No open trade.</p></div>
       </div>
     </section>
@@ -130,7 +130,7 @@
       <h3 class="subhead" id="strategies-title">Strategies tested side by side</h3>
       <p class="accuracy-note">Each strategy is counted at 5 shares a trade on practice money, with its own
         rules on the same windows (this bot's bigger trades are scaled down to 5 shares here). Profit is after
-        estimated fees. Most early differences are luck, so a strategy has to stay
+        fees. Most early differences are luck, so a strategy has to stay
         ahead by more than luck before it means anything.</p>
       <p class="accuracy-note">To test settle vs scalp, trade sizes and other rules on the recorded
         history, open the <a href="/lab">Strategy Lab</a>.</p>
@@ -192,6 +192,27 @@
           </div>
 
           <div class="setting">
+            <label for="set-max-open">Most trades open at once</label>
+            <div class="setting-control inline-input">
+              <input type="number" id="set-max-open" step="1" min="1" max="10" inputmode="numeric"><span>trades</span>
+            </div>
+            <p class="setting-help">1 means one trade at a time. With more, the bot can buy again in a window
+              it already holds and start the next window before the last one settles. Trades in the same
+              window win or lose together, so extra trades make the swings bigger, like a bigger trade size.
+              <span class="default" data-default="max-open"></span></p>
+          </div>
+
+          <div class="setting">
+            <label for="set-spacing">Wait between trades in a window</label>
+            <div class="setting-control inline-input">
+              <input type="number" id="set-spacing" step="5" min="0" max="240" inputmode="numeric"><span>seconds</span>
+            </div>
+            <p class="setting-help">After a trade, the bot waits at least this long before buying again in the
+              same window, so it doesn't buy one price several times in a row.
+              <span class="default" data-default="spacing"></span></p>
+          </div>
+
+          <div class="setting">
             <label for="set-edge-min">Minimum edge</label>
             <div class="setting-control inline-input">
               <input type="number" id="set-edge-min" step="0.5" min="0.5" inputmode="decimal"><span>¢ a share</span>
@@ -249,9 +270,9 @@
           <div class="setting setting-toggle">
             <label class="choice" for="set-fee-aware"><input type="checkbox" id="set-fee-aware">
               Edge must beat trading fees</label>
-            <p class="setting-help">The bot subtracts the fee real trades would pay (about 1.75¢ a share at
-              50¢, less near 0¢ or 100¢) before comparing its edge with the minimum. Results in the practice
-              balance stay fee-free either way. <span class="default" data-default="fee"></span></p>
+            <p class="setting-help">The bot subtracts the trading fee (about 1.75¢ a share at 50¢, less near
+              0¢ or 100¢) before comparing its edge with the minimum. The practice balance pays the fee
+              either way. <span class="default" data-default="fee"></span></p>
           </div>
 
           <p class="settings-error" id="settings-error" role="alert" hidden></p>
@@ -281,6 +302,6 @@
 </div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <noscript><p class="noscript">This screen needs JavaScript to show live data.</p></noscript>
-<script src="/static/simple.js?v={{ static_version }}.b5"></script>
+<script src="/static/simple.js?v={{ static_version }}.b6"></script>
 </body>
 </html>

@@ -377,21 +377,35 @@
     } else {
       parts.push('No finished trades yet.');
     }
-    if (d.position) {
+    var open = openTrades(d);
+    if (open.length > 1) {
+      parts.push('Includes ' + open.length + ' open trades at ' + money(w.open_value_usd) + '.');
+    } else if (open.length) {
       parts.push('Includes the open trade at ' + money(w.open_value_usd) + '.');
     }
     setText('balance-stats', parts.join(' '));
 
-    if (s.trades && s.est_fees_usd > 0) {
-      var gross = s.total_pnl_usd || 0;
-      var net = gross - s.est_fees_usd;
-      var n = s.trades === 1 ? 'the finished trade' : 'the ' + s.trades + ' finished trades';
-      setText('balance-fees', 'With real money, ' + n + ' would also have paid about ' +
-        money(s.est_fees_usd) + ' in fees, turning ' + signedMoney(gross) + ' into ' +
-        signedMoney(net) + '.');
+    // Fees are part of every result now (the wallet pays them). Older servers
+    // don't report fees_paid_usd, and their totals are before fees: say nothing.
+    if (w.fees_paid_usd > 0) {
+      setText('balance-fees', 'Every result here is after trading fees, the same ones real ' +
+        'Polymarket trades pay: ' + money(w.fees_paid_usd) + ' so far' +
+        (s.trades && s.gross_pnl_usd != null
+          ? ' (' + signedMoney(s.gross_pnl_usd) + ' before fees on finished trades).' : '.'));
     } else {
       setText('balance-fees', '');
     }
+  }
+
+  // Every open trade, newest first (older servers only send the newest one).
+  function openTrades(d) {
+    if (Array.isArray(d.positions)) return d.positions;
+    return d.position ? [d.position] : [];
+  }
+
+  function tradeLimit(d) {
+    var r = d.rules || {};
+    return d.bot && d.bot.mode === 'paper' && r.max_open > 1 ? r.max_open : 1;
   }
 
   // Big buy panel: the open trade in large type at the top of the page. A buy
@@ -425,40 +439,62 @@
     var beat = m.window_slug === p.window_slug && m.price_to_beat != null
       ? ' ' + money(m.price_to_beat) : ' the price to beat';
     setText('buy-detail', shares(p.shares) + ' at ' + cents(p.entry_price) + ' for ' +
-      money(p.cost_usd) + '. Pays ' + money(p.shares) + ' if Bitcoin finishes ' +
-      (up ? 'at or above' : 'below') + beat + (p.end_ts ? ' at ' + clock(p.end_ts) : '') + '.');
+      money(p.cost_usd) + feeText(p.fee_usd) + '. Pays ' + money(p.shares) +
+      ' if Bitcoin finishes ' + (up ? 'at or above' : 'below') + beat +
+      (p.end_ts ? ' at ' + clock(p.end_ts) : '') + '.');
+    var open = openTrades(d);
     setText('buy-meta', (p.opened_ts ? 'Bought at ' + clock(p.opened_ts) + '. ' : '') +
-      'Worth ' + money(p.value_usd) + ' now (' + signedMoney(p.unrealized_usd) + ').');
+      'Worth ' + money(p.value_usd) + ' now (' + signedMoney(p.unrealized_usd) +
+      (p.fee_usd > 0 ? ' after the fee' : '') + ').' +
+      (open.length > 1 ? ' The newest of ' + open.length + ' open trades.' : ''));
     document.title = (up ? '▲' : '▼') + ' Bought ' + p.side + ' – ' + BASE_TITLE;
+  }
+
+  // " + 17¢ fee" / " + $1.20 fee", or nothing for a fee-free (older) row.
+  function feeText(fee) {
+    if (!(fee > 0)) return '';
+    return ' + ' + (fee < 1 ? cents(fee) : money(fee)) + ' fee';
   }
 
   function renderPosition(d) {
     var box = $('position');
     box.replaceChildren();
-    var p = d.position;
-    if (!p) {
-      box.appendChild(el('p', 'muted', 'No open trade. The bot holds at most one at a time.'));
+    var open = openTrades(d);
+    var limit = tradeLimit(d);
+    setText('position-title', open.length > 1 ? 'Open trades (' + open.length + ')' : 'Open trade');
+    if (!open.length) {
+      box.appendChild(el('p', 'muted', limit > 1
+        ? 'No open trade. The bot holds up to ' + limit + ' at once.'
+        : 'No open trade. The bot holds at most one at a time.'));
       return;
     }
-    var side = el('p', 'position-side ' + (p.side === 'Up' ? 'is-up' : 'is-down'),
-      (p.side === 'Up' ? '▲ ' : '▼ ') + p.side);
-    box.appendChild(side);
+    box.classList.toggle('positions-many', open.length > 1);
+    open.forEach(function (p) {
+      var item = el('div', 'position-item');
+      var side = el('p', 'position-side ' + (p.side === 'Up' ? 'is-up' : 'is-down'),
+        (p.side === 'Up' ? '▲ ' : '▼ ') + p.side);
+      item.appendChild(side);
 
-    var lines = el('div', 'position-lines');
-    function line(before, strong, after) {
-      var row = el('p');
-      row.appendChild(document.createTextNode(before));
-      row.appendChild(el('strong', null, strong));
-      if (after) row.appendChild(document.createTextNode(after));
-      lines.appendChild(row);
-    }
-    line('Bought ', shares(p.shares), ' at ' + cents(p.entry_price) + ' for ' + money(p.cost_usd) + '.');
-    line('Worth ', money(p.value_usd), ' now (' + signedMoney(p.unrealized_usd) + ')' +
-      (p.marked_live ? '.' : ', valued at cost until a new price arrives.'));
-    var pays = p.side === 'Up' ? 'at or above' : 'below';
-    var when = p.end_ts ? ' at ' + clock(p.end_ts) : '';
-    line('Pays ', money(p.shares), ' if Bitcoin finishes ' + pays + ' the price to beat' + when + '.');
-    box.appendChild(lines);
+      var lines = el('div', 'position-lines');
+      function line(before, strong, after) {
+        var row = el('p');
+        row.appendChild(document.createTextNode(before));
+        row.appendChild(el('strong', null, strong));
+        if (after) row.appendChild(document.createTextNode(after));
+        lines.appendChild(row);
+      }
+      line('Bought ', shares(p.shares), ' at ' + cents(p.entry_price) + ' for ' +
+        money(p.cost_usd) + feeText(p.fee_usd) +
+        (p.opened_ts && open.length > 1 ? ' at ' + clock(p.opened_ts) : '') + '.');
+      line('Worth ', money(p.value_usd), ' now (' + signedMoney(p.unrealized_usd) +
+        (p.fee_usd > 0 ? ' after the fee' : '') + ')' +
+        (p.marked_live ? '.' : ', valued at cost until a new price arrives.'));
+      var pays = p.side === 'Up' ? 'at or above' : 'below';
+      var when = p.end_ts ? ' at ' + clock(p.end_ts) : '';
+      line('Pays ', money(p.shares), ' if Bitcoin finishes ' + pays + ' the price to beat' + when + '.');
+      item.appendChild(lines);
+      box.appendChild(item);
+    });
   }
 
   // ---------------------------------------------------------------- chart
@@ -588,8 +624,10 @@
       cd.setAttribute('cx', px); cd.setAttribute('cy', py);
       cross.setAttribute('visibility', 'visible');
       var when = (isToday(p.t) ? 'today' : shortDate(p.t)) + ' at ' + clock(p.t);
+      var nOpen = openTrades(d).length;
       var what = idx === 0 ? 'Starting balance, ' + shortDate(p.t)
-        : p.now ? (d.position ? 'Now, including the open trade' : 'Now')
+        : p.now ? (nOpen > 1 ? 'Now, including the ' + nOpen + ' open trades'
+          : nOpen ? 'Now, including the open trade' : 'Now')
           : 'After the trade that finished ' + when;
       tip.replaceChildren(el('strong', null, money(p.v)), el('span', null, what));
       tip.hidden = false;
@@ -685,6 +723,10 @@
 
       var profit = el('td', 'num', r.pnl_usd == null ? '—' : signedMoney(r.pnl_usd));
       setDirection(profit, r.pnl_usd == null ? null : Math.round(r.pnl_usd * 100));
+      if (r.fee_usd > 0) {
+        profit.appendChild(el('span', 'sub', r.pnl_usd == null
+          ? 'paid a ' + money(r.fee_usd) + ' fee' : 'after a ' + money(r.fee_usd) + ' fee'));
+      }
       tr.appendChild(profit);
 
       body.appendChild(tr);
@@ -718,16 +760,24 @@
       ' (a bigger gap usually means its data is behind the market), for shares priced from ',
       { b: cents(r.price_min) }, ' to ', { b: cents(r.price_max) }, ', with more than ',
       { b: (r.min_seconds_left || 0) + ' seconds' }, ' left in the window.']);
+    var many = r.max_open > 1;
     if (r.trade_shares) {
       para(['It buys ', { b: plain2.format(r.trade_shares) + ' shares' }, ' a trade, which costs ' +
         money(r.trade_shares * r.price_min) + ' to ' + money(r.trade_shares * r.price_max) +
-        ' across its price range. It makes at most one trade per window and holds until the ' +
-        'window settles. A winning share pays $1. A losing share pays nothing.']);
+        ' across its price range. ' + (many ? '' : 'It makes at most one trade per window and ' +
+        'holds until the window settles. ') + 'A winning share pays $1. A losing share pays nothing.']);
     } else {
-      para(['It makes at most one trade per window, spends ',
+      para(['It ' + (many ? '' : 'makes at most one trade per window, ') + 'spends ',
         { b: money(r.trade_min_usd) + ' to ' + money(r.trade_max_usd) },
         ' a trade (at least ' + plain2.format(r.min_shares || 5) + ' shares), and holds ' +
         'until the window settles. A winning share pays $1. A losing share pays nothing.']);
+    }
+    if (many) {
+      para(['It holds up to ', { b: r.max_open + ' trades at once' }, ', so it can buy again in a ' +
+        'window it already holds, at least ', { b: (r.spacing_seconds || 0) + ' seconds' },
+        ' after its last trade there, and start the next window before the last one has settled. ' +
+        'It holds each trade until its window settles. Trades in the same window win or lose ' +
+        'together, so extra trades make the swings bigger, like a bigger trade size.']);
     }
     if (r.learning) {
       para(['The ', { b: 'learned chances' }, ' setting is on, so that estimate is corrected by what ' +
@@ -738,9 +788,9 @@
       para(['The ', { b: 'edge must beat trading fees' }, ' setting is on, so the bot subtracts ' +
         'the fee from its edge before comparing it with the minimum.']);
     }
-    para(['Practice trades leave out trading fees. Real Polymarket purchases pay a fee, ' +
-      'about ', { b: cents((r.fee_rate || 0.07) * 0.25) + ' a share' },
-      ' on a 50¢ share, so the balance card also shows what fees would have cost.']);
+    para(['Practice trades pay the same trading fee real Polymarket purchases do, about ',
+      { b: cents((r.fee_rate || 0.07) * 0.25) + ' a share' }, ' on a 50¢ share and less near 0¢ or ' +
+      '100¢, and every balance, profit and loss on this screen is after it.']);
     para(['A practice record can’t prove the strategy makes money. Treat it as a test ' +
       'over many trades, not a forecast.']);
   }
@@ -807,6 +857,8 @@
       tick: v.paper_tick_seconds,
       feeAware: !!v.paper_fee_aware,
       learning: !!v.paper_learning,
+      maxOpen: v.paper_max_open_positions == null ? 1 : v.paper_max_open_positions,
+      spacing: v.paper_entry_spacing_seconds == null ? 0 : v.paper_entry_spacing_seconds,
     };
   }
 
@@ -820,6 +872,8 @@
     $('set-tick').value = f.tick;
     $('set-fee-aware').checked = f.feeAware;
     $('set-learning').checked = f.learning;
+    $('set-max-open').value = f.maxOpen;
+    $('set-spacing').value = f.spacing;
   }
 
   function readSettingsForm() {
@@ -837,6 +891,8 @@
       tick: num('set-tick'),
       feeAware: $('set-fee-aware').checked,
       learning: $('set-learning').checked,
+      maxOpen: num('set-max-open'),
+      spacing: num('set-spacing'),
     };
   }
 
@@ -865,6 +921,19 @@
       return 'The no-new-trades time must be a whole number of seconds from 0 to 600.';
     }
     if (!within(f.tick, 1, 60)) return 'Check the market every 1 to 60 seconds.';
+    if (b.paper_max_open_positions) {
+      var mo = b.paper_max_open_positions;
+      if (!within(f.maxOpen, mo[0], mo[1]) || Math.round(f.maxOpen) !== f.maxOpen) {
+        return 'Trades open at once must be a whole number from ' + mo[0] + ' to ' + mo[1] + '.';
+      }
+    }
+    if (b.paper_entry_spacing_seconds) {
+      var sp = b.paper_entry_spacing_seconds;
+      if (!within(f.spacing, sp[0], sp[1]) || Math.round(f.spacing) !== f.spacing) {
+        return 'The wait between trades must be a whole number of seconds from ' + sp[0] +
+          ' to ' + sp[1] + '.';
+      }
+    }
     return '';
   }
 
@@ -894,6 +963,12 @@
     if (!sameNumber(v.paper_tick_seconds, f.tick)) out.paper_tick_seconds = f.tick;
     if (!!v.paper_fee_aware !== f.feeAware) out.paper_fee_aware = f.feeAware;
     if (!!v.paper_learning !== f.learning) out.paper_learning = f.learning;
+    if ('paper_max_open_positions' in v && !sameNumber(v.paper_max_open_positions, f.maxOpen)) {
+      out.paper_max_open_positions = f.maxOpen;
+    }
+    if ('paper_entry_spacing_seconds' in v && !sameNumber(v.paper_entry_spacing_seconds, f.spacing)) {
+      out.paper_entry_spacing_seconds = f.spacing;
+    }
     return out;
   }
 
@@ -1005,6 +1080,10 @@
       tick: 'Default ' + plain2.format(dft.paper_tick_seconds) + ' seconds.',
       fee: 'Off by default.',
       learning: 'On by default.',
+      'max-open': dft.paper_max_open_positions == null ? ''
+        : 'Default ' + dft.paper_max_open_positions + '.',
+      spacing: dft.paper_entry_spacing_seconds == null ? ''
+        : 'Default ' + dft.paper_entry_spacing_seconds + ' seconds.',
     };
     document.querySelectorAll('[data-default]').forEach(function (node) {
       node.textContent = text[node.dataset.default] || '';
@@ -1019,8 +1098,10 @@
     $('settings-restart').hidden = !!st;
     if (!st) return;
     $('shares-note').hidden = !!st.values.trade_shares;
-    // Older servers don't know the learning setting: don't offer it.
+    // Older servers don't know these settings: don't offer them.
     $('set-learning').closest('.setting').hidden = !('paper_learning' in st.values);
+    $('set-max-open').closest('.setting').hidden = !('paper_max_open_positions' in st.values);
+    $('set-spacing').closest('.setting').hidden = !('paper_entry_spacing_seconds' in st.values);
     var key = JSON.stringify(st.values);
     if (!S.settingsDirty && key !== S.settingsKey) {
       fillSettingsForm(settingsToForm(st));

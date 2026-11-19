@@ -440,6 +440,14 @@ a { color: var(--accent); }
   font-weight: 600;
 }
 
+/* Several open trades: a compact stack, newest first. */
+.positions-many .position-side { font-size: 22px; margin-top: 4px; }
+.position-item + .position-item {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--rule);
+}
+
 /* ---------- Chart ---------- */
 
 .chart-section, .trades-section, .more { margin-top: 40px; }

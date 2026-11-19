@@ -2,7 +2,8 @@
 
 The simple screen is the everyday view of the BTC paper bot: practice balance,
 Start/Stop, the current Up/Down window and what the bot is doing about it in
-plain words, the open trade, a balance chart, and the trade history.
+plain words, the open trades, a balance chart, and the trade history. Every
+money figure is after trading fees.
 
 Read-only by design. Everything here SELECTs from the SQLite ledger the paper
 loop already writes (``paper_ticks``, ``paper_positions``, ``paper_wallet``,
@@ -16,6 +17,7 @@ arithmetic are unit-testable without a running loop or network.
 """
 from __future__ import annotations
 
+import bisect
 import math
 import re
 from datetime import UTC, datetime, timedelta
@@ -62,10 +64,12 @@ STRATEGIES: tuple[tuple[str, str, str], ...] = (
     ("pricing_fresh_v8", "First minute only", "Original rules, only in a window's first 60 seconds"),
 )
 
-# Estimated venue taker fee per share for a fill at price ``p``: rate*p*(1-p)
+# Venue taker fee per share for a fill at price ``p``: rate*p*(1-p)
 # (polymarket_bot/shadow/fees.py, the same formula the live ledger books).
-# The paper ledger itself is fee-free, so the screen shows this separately as
-# an estimate of what the same trades would have paid with real money.
+# Since 2026-11-18 the paper wallet PAYS it on every taker fill (``fee_usd`` on
+# each wallet transaction; earlier trades were charged once, see
+# paper_wallet.book_past_fees), so every profit, loss and balance here is
+# after fees.
 TAKER_FEE_RATE = DEFAULT_TAKER_FEE_RATE
 
 # Calibration buckets for "How accurate is the bot?" (the bot's own chance of
@@ -154,6 +158,27 @@ def _clock(ts: float | None) -> str:
     return datetime.fromtimestamp(ts, UTC).strftime("%H:%M UTC")
 
 
+class _Running:
+    """Running total of ``(wallet txn id, amount)`` events as of a given id."""
+
+    def __init__(self, events: list[tuple[int, float]]) -> None:
+        pts = sorted(events)
+        self._ids = [i for i, _ in pts]
+        self._sums: list[float] = []
+        run = 0.0
+        for _, amount in pts:
+            run += amount
+            self._sums.append(run)
+
+    def at(self, txn_id: Any) -> float:
+        try:
+            tid = int(txn_id)
+        except (TypeError, ValueError):
+            return 0.0
+        k = bisect.bisect_right(self._ids, tid)
+        return self._sums[k - 1] if k else 0.0
+
+
 def downsample(points: list[dict[str, Any]], limit: int = CURVE_POINTS_MAX) -> list[dict[str, Any]]:
     """Keep at most ``limit`` points, always keeping the first and the last."""
     if len(points) <= limit or limit < 2:
@@ -171,9 +196,9 @@ def downsample(points: list[dict[str, Any]], limit: int = CURVE_POINTS_MAX) -> l
 _TRADES_SQL = """
 SELECT p.position_id, p.opened_at, p.closed_at, p.window_slug, p.side, p.state,
        p.entry_price, p.exit_price, p.shares, p.exit_reason,
-       -b.amount_usd AS cost_usd,
+       -b.amount_usd AS cost_usd, b.fee_usd AS buy_fee_usd,
        x.transaction_type AS exit_type, x.amount_usd AS exit_usd, x.created_at AS exit_at,
-       x.id AS exit_id
+       x.id AS exit_id, x.fee_usd AS exit_fee_usd
   FROM paper_positions p
   JOIN paper_wallet_transactions b
     ON b.position_id = p.position_id AND b.transaction_type = 'BUY'
@@ -184,11 +209,15 @@ SELECT p.position_id, p.opened_at, p.closed_at, p.window_slug, p.side, p.state,
 """
 
 # Every finished wallet trade, for the totals (not just the rows on screen).
+# pnl_usd is after the fees both fills paid.
 _CLOSED_SQL = """
-SELECT p.shares, p.entry_price, p.exit_price, p.edge, b.created_at AS opened_at,
-       x.transaction_type AS exit_type, x.id AS exit_id,
+SELECT p.position_id, p.shares, p.entry_price, p.exit_price, p.edge,
+       b.created_at AS opened_at, b.id AS buy_id, b.fee_usd AS buy_fee_usd,
+       -b.amount_usd AS cost_usd,
+       x.transaction_type AS exit_type, x.id AS exit_id, x.fee_usd AS exit_fee_usd,
        x.amount_usd AS payout_usd,
-       x.amount_usd + b.amount_usd AS pnl_usd
+       b.fee_usd + x.fee_usd AS fee_usd,
+       x.amount_usd + b.amount_usd - b.fee_usd - x.fee_usd AS pnl_usd
   FROM paper_wallet_transactions b
   JOIN paper_wallet_transactions x
     ON x.position_id = b.position_id AND x.transaction_type IN ('SELL', 'SETTLEMENT')
@@ -198,7 +227,7 @@ SELECT p.shares, p.entry_price, p.exit_price, p.edge, b.created_at AS opened_at,
 
 _OPEN_SQL = """
 SELECT p.position_id, p.opened_at, p.window_slug, p.side, p.entry_price, p.shares,
-       -b.amount_usd AS cost_usd
+       -b.amount_usd AS cost_usd, b.fee_usd AS fee_usd, b.id AS buy_id
   FROM paper_positions p
   JOIN paper_wallet_transactions b
     ON b.position_id = p.position_id AND b.transaction_type = 'BUY'
@@ -271,6 +300,9 @@ async def load_raw() -> dict[str, Any]:
         rescales = await _one(
             db, "SELECT value FROM config WHERE key = ?", (_wallet.RESCALE_KEY,)
         )
+        fees_from = await _one(
+            db, "SELECT value FROM config WHERE key = ?", (_wallet.FEES_KEY,)
+        )
         # Entries the RiskGate refused in the last hour: a setting that blocks
         # every trade (2026-11-18: $20-$100 sizing vs the $3 per-trade cap) must
         # show on the screen, not only in the current window's verdict.
@@ -292,7 +324,8 @@ async def load_raw() -> dict[str, Any]:
         blocked = None
         slug = tick.get("window_slug") if tick else None
         if slug:
-            # Mirrors the loop's own one-entry-per-window guard (any mode).
+            # Trades in this window: in hold-to-settle style the loop makes at
+            # most "Most trades open at once" of them (one in live mode).
             row = await _one(
                 db,
                 "SELECT COUNT(*) AS n FROM paper_positions WHERE window_slug = ?",
@@ -323,6 +356,7 @@ async def load_raw() -> dict[str, Any]:
         "learning_raw": learning_row["value"] if learning_row else None,
         "learning_started": learning_start["t"] if learning_start else None,
         "rescales_raw": rescales["value"] if rescales else None,
+        "fees_from_raw": fees_from["value"] if fees_from else None,
     }
 
 
@@ -396,6 +430,29 @@ def _market(
     }
 
 
+def _trades_phrase(rows: list[dict[str, Any]]) -> str:
+    """'an Up trade', '2 Up trades', '3 trades (2 Up, 1 Down)'."""
+    ups = sum(1 for r in rows if r.get("side") == "Up")
+    downs = len(rows) - ups
+    if len(rows) == 1:
+        return "an Up trade" if ups else "a Down trade"
+    if not downs:
+        return f"{ups} Up trades"
+    if not ups:
+        return f"{downs} Down trades"
+    return f"{len(rows)} trades ({ups} Up, {downs} Down)"
+
+
+def _trade_limit(rules: dict[str, Any], mode: str) -> int:
+    """How many trades the loop holds at once (one in real-money mode)."""
+    if mode != "paper":
+        return 1
+    try:
+        return max(1, int(rules.get("max_open") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def explain(
     *,
     bot_state: str,
@@ -406,11 +463,16 @@ def explain(
     blocked: dict[str, Any] | None,
     rules: dict[str, Any],
     mode: str = "paper",
+    positions: list[dict[str, Any]] | None = None,
 ) -> dict[str, str]:
     """One plain-English sentence (+ detail) for what the bot is doing now.
 
     ``tone`` drives the styling only: idle | wait | watch | trade | warn.
+    ``positions`` is every open trade (newest first); ``position`` alone (the
+    newest) is enough for older callers.
     """
+    if positions is None:
+        positions = [position] if position is not None else []
     if bot_state != "running":
         if mode != "paper":
             return {
@@ -446,40 +508,66 @@ def explain(
             "detail": "The bot keeps retrying on its own." + ago,
         }
     end_ts = market.get("end_ts")
-    if position is not None:
-        if position.get("window_slug") == market.get("window_slug"):
-            side = position["side"]
+    limit = _trade_limit(rules, mode)
+    here = [p for p in positions if p.get("window_slug") == market.get("window_slug")]
+    total_open = max(int(any_open or 0), len(positions))
+    if here and total_open >= limit:
+        if len(here) == 1:
+            side = here[0]["side"]
             pays = "at or above" if side == "Up" else "below"
-            article = "an" if side == "Up" else "a"
-            return {
-                "tone": "trade",
-                "headline": f"Holding {article} {side} trade until this window settles.",
-                "detail": f"Each share pays $1 if Bitcoin finishes {pays} "
-                "the price to beat, and nothing otherwise.",
-            }
+            detail = (f"Each share pays $1 if Bitcoin finishes {pays} "
+                      "the price to beat, and nothing otherwise.")
+        else:
+            detail = ("Each share pays $1 if it wins and nothing otherwise. Trades in the "
+                      "same window win or lose together.")
+        if limit > 1:
+            detail += f" {limit} is the most it holds at once (you can change that in Settings)."
+        return {
+            "tone": "trade",
+            "headline": f"Holding {_trades_phrase(here)} until this window settles.",
+            "detail": detail,
+        }
+    if total_open >= limit:
+        last = "the last trade" if total_open == 1 else "the last trades"
         return {
             "tone": "wait",
-            "headline": "Waiting for the last trade to settle.",
-            "detail": "The bot holds one trade at a time.",
+            "headline": f"Waiting for {last} to settle.",
+            "detail": "The bot holds one trade at a time." if limit == 1
+            else f"The bot holds up to {limit} trades at once.",
         }
-    if any_open:
-        return {
-            "tone": "wait",
-            "headline": "Waiting for an open trade to settle.",
-            "detail": "The bot holds one trade at a time.",
-        }
-    if window_trades:
+    if window_trades >= limit and rules.get("exit_style", "settle") == "settle":
+        per = "one trade" if limit == 1 else f"{limit} trades"
         return {
             "tone": "watch",
             "headline": "Done with this window.",
-            "detail": "The bot makes at most one trade per window. "
+            "detail": f"The bot makes at most {per} per window. "
             f"It looks again when the next one starts at {_clock(end_ts)}.",
         }
+    # Room for another trade. Say what's already held so the line below reads
+    # as "and here's why it isn't adding one".
+    holding = ""
+    if here:
+        room = limit - total_open
+        more = "1 more" if room == 1 else f"{room} more"
+        holding = f"It holds {_trades_phrase(here)} in this window and can add {more}. "
+    spacing = int(rules.get("spacing_seconds") or 0)
+    newest = max((p.get("opened_ts") or 0.0 for p in here), default=None)
+    tick_ts = market.get("tick_ts")
+    if here and spacing > 0 and newest and tick_ts is not None:
+        wait = int(math.ceil(spacing - (tick_ts - newest)))
+        if wait > 0:
+            return {
+                "tone": "trade",
+                "headline": f"Holding {_trades_phrase(here)}, waiting before another.",
+                "detail": f"After each trade it waits {spacing} seconds before buying again in "
+                f"the same window (about {wait} seconds to go), so it doesn't buy one price "
+                f"twice. It can hold up to {limit} at once.",
+            }
     if blocked is not None and blocked.get("error"):
         return {
             "tone": "warn",
             "headline": "A safety limit blocked a trade in this window.",
-            "detail": "It refused because " + block_reason_plain(blocked["error"]),
+            "detail": holding + "It refused because " + block_reason_plain(blocked["error"]),
         }
     reason = market.get("reason") or ""
     best_side = market.get("best_side")
@@ -489,8 +577,25 @@ def explain(
         return {
             "tone": "trade",
             "headline": f"Buying {side} now.",
-            "detail": "The bot's estimate beats the asking price by enough to trade.",
+            "detail": holding + "The bot's estimate beats the asking price by enough to trade.",
         }
+    out = _market_explain(market, rules, end_ts, reason, best_side, best_edge)
+    if holding:
+        out = {**out, "detail": holding + out["detail"]}
+        if out["tone"] == "watch":
+            out["tone"] = "trade"
+    return out
+
+
+def _market_explain(
+    market: dict[str, Any],
+    rules: dict[str, Any],
+    end_ts: Any,
+    reason: str,
+    best_side: str | None,
+    best_edge: float | None,
+) -> dict[str, str]:
+    """Why the current tick isn't a buy, from the loop's own skip reason."""
     if market.get("degraded"):
         return {
             "tone": "warn",
@@ -548,13 +653,16 @@ def explain(
     return {"tone": "watch", "headline": "Watching the market.", "detail": reason}
 
 
-def _position(
+def _positions(
     open_rows: list[dict[str, Any]], tick: dict[str, Any] | None
-) -> tuple[dict[str, Any] | None, float]:
-    """(the open wallet trade marked to market, total marked value of all open)."""
+) -> tuple[list[dict[str, Any]], float]:
+    """(every open wallet trade marked to market, newest first; their total value).
+
+    ``unrealized_usd`` is after the entry fee, which the wallet already paid.
+    """
     current_slug = (tick or {}).get("window_slug")
     total_value = 0.0
-    shown: dict[str, Any] | None = None
+    out: list[dict[str, Any]] = []
     for row in open_rows:
         shares = _num(row.get("shares")) or 0.0
         entry = _price(row.get("entry_price")) or 0.0
@@ -564,32 +672,42 @@ def _position(
         mark = bid if marked_live else entry
         value = shares * mark
         total_value += value
-        if shown is None:
-            cost = _num(row.get("cost_usd")) or shares * entry
-            window = parse_window_slug(row.get("window_slug")) or {}
-            shown = {
-                "position_id": row.get("position_id"),
-                "window_slug": row.get("window_slug"),
-                "side": side,
-                "shares": round(shares, 4),
-                "entry_price": entry,
-                "cost_usd": round(cost, 4),
-                "mark_price": mark,
-                "marked_live": marked_live,
-                "value_usd": round(value, 4),
-                "unrealized_usd": round(value - cost, 4),
-                "opened_ts": iso_to_ts(row.get("opened_at")),
-                "start_ts": window.get("start_ts"),
-                "end_ts": window.get("end_ts"),
-            }
-    return shown, total_value
+        cost = _num(row.get("cost_usd")) or shares * entry
+        fee = _num(row.get("fee_usd")) or 0.0
+        window = parse_window_slug(row.get("window_slug")) or {}
+        out.append({
+            "position_id": row.get("position_id"),
+            "window_slug": row.get("window_slug"),
+            "side": side,
+            "shares": round(shares, 4),
+            "entry_price": entry,
+            "cost_usd": round(cost, 4),
+            "fee_usd": round(fee, 4),
+            "mark_price": mark,
+            "marked_live": marked_live,
+            "value_usd": round(value, 4),
+            "unrealized_usd": round(value - cost - fee, 4),
+            "opened_ts": iso_to_ts(row.get("opened_at")),
+            "start_ts": window.get("start_ts"),
+            "end_ts": window.get("end_ts"),
+        })
+    return out, total_value
+
+
+def _position(
+    open_rows: list[dict[str, Any]], tick: dict[str, Any] | None
+) -> tuple[dict[str, Any] | None, float]:
+    """(the newest open wallet trade marked to market, total value of all open)."""
+    rows, total_value = _positions(open_rows, tick)
+    return (rows[0] if rows else None), total_value
 
 
 def _trade_rows(
     rows: list[dict[str, Any]], rescales: list[_wallet.Rescale] | None = None
 ) -> list[dict[str, Any]]:
     """Trades as they happened. ``scale`` is how many times the balance and the
-    totals count each one (above 1 for trades before a practice balance switch)."""
+    totals count each one (above 1 for trades before a practice balance switch).
+    ``pnl_usd`` is after ``fee_usd``, the fees the wallet paid for the trade."""
     out: list[dict[str, Any]] = []
     for row in rows:
         window = parse_window_slug(row.get("window_slug")) or {}
@@ -598,16 +716,14 @@ def _trade_rows(
         exit_usd = _num(row.get("exit_usd"))
         shares = _num(row.get("shares")) or 0.0
         entry = _price(row.get("entry_price"))
+        fee = (_num(row.get("buy_fee_usd")) or 0.0) + (_num(row.get("exit_fee_usd")) or 0.0)
         if exit_type is None or exit_usd is None:
             result, pnl = "open", None
         elif exit_type == "SETTLEMENT":
             result = "won" if exit_usd > 0 else "lost"
-            pnl = exit_usd - cost
+            pnl = exit_usd - cost - fee
         else:
-            result, pnl = "sold", exit_usd - cost
-        fee = estimated_fee(shares, entry)
-        if exit_type == "SELL":
-            fee += estimated_fee(shares, _price(row.get("exit_price")))
+            result, pnl = "sold", exit_usd - cost - fee
         out.append(
             {
                 "position_id": row.get("position_id"),
@@ -622,7 +738,7 @@ def _trade_rows(
                 "cost_usd": round(cost, 4),
                 "payout_usd": None if exit_usd is None else round(exit_usd, 4),
                 "pnl_usd": None if pnl is None else round(pnl, 4),
-                "est_fee_usd": round(fee, 4),
+                "fee_usd": round(fee, 4),
                 "result": result,
                 "exit_reason": row.get("exit_reason"),
                 "scale": _wallet.scale_for_txn(row.get("exit_id"), rescales or []),
@@ -643,14 +759,14 @@ def _k(row: dict[str, Any]) -> float:
 
 
 def _stats(closed: list[dict[str, Any]]) -> dict[str, Any]:
+    """Totals of the finished trades, after fees (``fees_usd`` is what they paid).
+
+    ``est_fees_usd`` is gone on purpose: an older open page reads it as "fees
+    still to come off" and would subtract them a second time.
+    """
     pnls = [p * _k(r) for r in closed if (p := _num(r.get("pnl_usd"))) is not None]
-    fees = 0.0
-    for r in closed:
-        shares = _num(r.get("shares"))
-        fee = estimated_fee(shares, _price(r.get("entry_price")))
-        if r.get("exit_type") == "SELL":
-            fee += estimated_fee(shares, _price(r.get("exit_price")))
-        fees += fee * _k(r)
+    fees = sum((_num(r.get("fee_usd")) or 0.0) * _k(r) for r in closed
+               if _num(r.get("pnl_usd")) is not None)
     count = len(pnls)
     wins = sum(1 for p in pnls if p > 0)
     losses = sum(1 for p in pnls if p < 0)
@@ -661,10 +777,11 @@ def _stats(closed: list[dict[str, Any]]) -> dict[str, Any]:
         "losses": losses,
         "win_rate": (wins / count) if count else None,
         "total_pnl_usd": round(total, 4),
+        "gross_pnl_usd": round(total + fees, 4),
+        "fees_usd": round(fees, 4),
         "best_usd": round(max(pnls), 4) if pnls else None,
         "worst_usd": round(min(pnls), 4) if pnls else None,
         "avg_usd": round(total / count, 4) if count else None,
-        "est_fees_usd": round(fees, 4),
     }
 
 
@@ -684,12 +801,14 @@ def _accuracy(closed: list[dict[str, Any]]) -> dict[str, Any]:
         edge = _num(r.get("edge"))
         payout = _num(r.get("payout_usd"))
         shares = _num(r.get("shares"))
-        pnl = _num(r.get("pnl_usd"))
+        pnl = _num(r.get("pnl_usd"))  # after fees
         if price is None or edge is None or payout is None or not shares or pnl is None:
             continue
         said = min(0.999, max(0.0, price + edge))
         k = _k(r)
-        rows.append((said, price, payout > 0, pnl * k, estimated_fee(shares, price) * k))
+        fee = _num(r.get("fee_usd")) or 0.0
+        # (said, price, won, profit before fees, fees)
+        rows.append((said, price, payout > 0, (pnl + fee) * k, fee * k))
     n = len(rows)
     if n == 0:
         return {"trades": 0, "buckets": [], "summary": []}
@@ -844,13 +963,14 @@ def _strategies(raw: dict[str, Any]) -> list[dict[str, Any]]:
                     opened = iso_to_ts(row.get("opened_at"))
                     shares = _num(row.get("shares")) or 0.0
                     entry = _num(row.get("entry_price"))
-                    gross = _num(row.get("pnl_usd"))
-                    if opened is None or opened < started or entry is None or gross is None:
+                    after = _num(row.get("pnl_usd"))  # the wallet's, after its fees
+                    if opened is None or opened < started or entry is None or after is None:
                         continue
                     if shares <= 0:
                         continue
+                    gross = after + (_num(row.get("fee_usd")) or 0.0)
                     # Per 5 shares, like every shadow row (10-share trades halve).
-                    net = (gross - estimated_fee(shares, entry)) * STRATEGY_SHARES / shares
+                    net = after * STRATEGY_SHARES / shares
                     n += 1
                     wins += 1 if gross > 0 else 0
                     price_sum += entry
@@ -888,9 +1008,13 @@ def build_payload(
     tick = raw.get("tick")
     stale_after = max(float(rules.get("tick_seconds") or 5.0) * 3, 20.0)
     market = _market(tick, now, stale_after, bool(rules.get("fee_aware")))
-    position, open_value = _position(raw.get("open_positions") or [], tick)
+    open_rows = raw.get("open_positions") or []
+    positions, open_value = _positions(open_rows, tick)
+    position = positions[0] if positions else None
     rescales = _wallet.load_rescales(raw.get("rescales_raw"))
     closed = _scaled(raw.get("closed") or [], rescales)
+    fees_from = _wallet.load_fee_catch_up(raw.get("fees_from_raw"))
+    open_fees = sum(p["fee_usd"] for p in positions)
 
     wallet_row = raw.get("wallet")
     wallet = None
@@ -905,6 +1029,11 @@ def build_payload(
             "equity_usd": round(equity, 4),
             "pnl_usd": round(equity - initial, 4),
             "pnl_pct": ((equity - initial) / initial) if initial else None,
+            # Every fee the practice wallet has paid, on today's scale.
+            "fees_paid_usd": round(
+                sum((_num(r.get("fee_usd")) or 0.0) * _k(r) for r in closed) + open_fees, 4
+            ),
+            "fees_from_ts": iso_to_ts(fees_from.at) if fees_from else None,
             "since_ts": iso_to_ts(wallet_row.get("initialized_at")),
             # The latest practice balance switch, for the line under the balance.
             "rescale": None if not rescales else {
@@ -916,15 +1045,44 @@ def build_payload(
             },
         }
 
+    # Balances booked before fees were charged didn't include them yet: each
+    # is shown minus the fees its trades had paid by then, so the chart is
+    # after fees all the way back and has no drop on the day fees started.
+    fee_events: list[tuple[int, float]] = []
+    for r in closed:
+        k = _k(r)
+        if r.get("buy_id") is not None:
+            fee_events.append((int(r["buy_id"]), (_num(r.get("buy_fee_usd")) or 0.0) * k))
+        if r.get("exit_id") is not None and _num(r.get("exit_fee_usd")):
+            fee_events.append((int(r["exit_id"]), (_num(r.get("exit_fee_usd")) or 0.0) * k))
+    for r in open_rows:
+        if r.get("buy_id") is not None:
+            fee_events.append((int(r["buy_id"]), _num(r.get("fee_usd")) or 0.0))
+    shift = _wallet.FeeShift(fees_from, fee_events)
+    # Trades still open at each point count at cost (cash + open trades, the
+    # balance the Lab and the switch use): several trades in one window
+    # settle one ledger row at a time and the chart must not dip in between.
+    cost_events: list[tuple[int, float]] = []
+    for r in raw.get("closed") or []:
+        cost = _num(r.get("cost_usd")) or 0.0
+        if r.get("buy_id") is not None and r.get("exit_id") is not None:
+            cost_events += [(int(r["buy_id"]), cost), (int(r["exit_id"]), -cost)]
+    for r in open_rows:
+        if r.get("buy_id") is not None:
+            cost_events.append((int(r["buy_id"]), _num(r.get("cost_usd")) or 0.0))
+    held = _Running(cost_events)
+
     curve: list[dict[str, Any]] = []
     if wallet is not None and wallet["since_ts"] is not None:
         curve.append({"t": wallet["since_ts"], "v": wallet["initial_usd"]})
     for row in raw.get("curve") or []:
         ts, value = iso_to_ts(row.get("created_at")), _num(row.get("cash_after_usd"))
         if ts is not None and value is not None:
+            value += held.at(row.get("id"))
             # Balances booked before a practice balance switch, on today's
             # scale, so the chart has no jump at the switch.
             value = _wallet.balance_on_today_scale(value, row.get("id"), rescales)
+            value -= shift.at(row.get("id"))
             curve.append({"t": ts, "v": round(value, 4)})
 
     decision = explain(
@@ -936,6 +1094,7 @@ def build_payload(
         blocked=raw.get("blocked"),
         rules=rules,
         mode=bot.get("mode", "paper"),
+        positions=positions,
     )
 
     curve = downsample(curve)
@@ -967,6 +1126,7 @@ def build_payload(
         "decision": decision,
         "wallet": wallet,
         "position": position,
+        "positions": positions,
         "any_open": int(raw.get("any_open") or 0),
         "stats": _stats(closed),
         "accuracy": _accuracy(closed),

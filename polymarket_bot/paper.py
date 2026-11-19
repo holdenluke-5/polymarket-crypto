@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -822,8 +823,11 @@ def _f(row: Any, key: str) -> float | None:
 
 
 def _risk_state(open_positions: int, last_tick_at: str | None) -> str:
-    if open_positions > 1:
-        return "BREACH: more than one open BTC paper position"
+    limit = max_open_positions()
+    if open_positions > limit:
+        if limit == 1:
+            return "BREACH: more than one open BTC paper position"
+        return f"BREACH: more than {limit} open BTC paper positions"
     if last_tick_at is None:
         return "IDLE: no ticks yet"
     try:
@@ -1288,37 +1292,109 @@ async def _log_tick(snapshot: PaperSnapshot) -> None:
         await db.commit()
 
 
+def max_open_positions() -> int:
+    """How many BTC positions may be open at once.
+
+    Paper: the operator's "Most trades open at once" setting (1 = the old
+    one-at-a-time rule). LIVE: always 1 — the executor holds a single
+    position (its singleton gate, issue #91) and live sizing was never
+    validated for stacked entries.
+    """
+    if _live_executor is not None:
+        return 1
+    try:
+        return max(1, int(_knobs.cached("paper_max_open_positions")))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _spacing_wait_seconds(
+    snapshot: PaperSnapshot, open_rows: list[dict[str, Any]]
+) -> int:
+    """Seconds left before another entry may open in this window (0 = now).
+
+    Counts from the newest position still OPEN in the snapshot's window, so
+    one signal isn't bought on several ticks in a row. A window with no open
+    position (a scalp exit, or the first entry) never waits.
+    """
+    spacing = int(_knobs.cached("paper_entry_spacing_seconds") or 0)
+    if spacing <= 0:
+        return 0
+    now = _iso_seconds(snapshot.created_at)
+    newest = max(
+        (
+            t
+            for row in open_rows
+            if row.get("window_slug") == snapshot.window_slug
+            and (t := _iso_seconds(row.get("opened_at"))) is not None
+        ),
+        default=None,
+    )
+    if now is None or newest is None:
+        return 0
+    return max(0, int(math.ceil(spacing - (now - newest))))
+
+
+def _iso_seconds(value: Any) -> float | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
 async def _maybe_open_position(snapshot: PaperSnapshot) -> None:
     if not snapshot.signal_side or snapshot.notional_usd <= 0:
         return
+    limit = max_open_positions()
     async with connect() as db:
         async with db.execute(
-            "SELECT COUNT(*) AS n FROM paper_positions WHERE state = 'open'"
+            "SELECT window_slug, opened_at FROM paper_positions WHERE state = 'open'"
         ) as cur:
-            if (await cur.fetchone())["n"]:
-                log.info(
-                    "paper_entry.skipped_open_position",
-                    window_slug=snapshot.window_slug,
-                    side=snapshot.signal_side,
-                    reason="another position is already open",
-                )
-                return
+            open_rows = [dict(r) for r in await cur.fetchall()]
+        if len(open_rows) >= limit:
+            log.info(
+                "paper_entry.skipped_open_position",
+                window_slug=snapshot.window_slug,
+                side=snapshot.signal_side,
+                open_positions=len(open_rows),
+                limit=limit,
+                reason="another position is already open"
+                if limit == 1
+                else f"{len(open_rows)} positions open, the most allowed at once",
+            )
+            return
         if _knobs.cached('exit_style') == "settle":
-            # One entry per window, ever (issue #28): re-entering the same
-            # window after an exit pays the spread again for the same signal
-            # — the churn that lost the scalp-style soak.
+            # Entries per window are capped at the same limit (issue #28 kept
+            # it to one): re-entering a window after a Stop sold the position
+            # pays the spread again for the same signal — the churn that lost
+            # the scalp-style soak. With a limit of 1 this is the old rule.
             async with db.execute(
                 "SELECT COUNT(*) AS n FROM paper_positions WHERE window_slug = ?",
                 (snapshot.window_slug,),
             ) as cur:
-                if (await cur.fetchone())["n"]:
-                    log.info(
-                        "paper_entry.skipped_window_already_traded",
-                        window_slug=snapshot.window_slug,
-                        side=snapshot.signal_side,
-                        reason="settle style allows one entry per window",
-                    )
-                    return
+                window_count = int((await cur.fetchone())["n"])
+            if window_count >= limit:
+                log.info(
+                    "paper_entry.skipped_window_already_traded",
+                    window_slug=snapshot.window_slug,
+                    side=snapshot.signal_side,
+                    reason="settle style allows one entry per window"
+                    if limit == 1
+                    else f"settle style allows {limit} entries per window",
+                )
+                return
+    wait = _spacing_wait_seconds(snapshot, open_rows)
+    if wait > 0:
+        log.info(
+            "paper_entry.skipped_spacing",
+            window_slug=snapshot.window_slug,
+            side=snapshot.signal_side,
+            wait_seconds=wait,
+        )
+        return
     # Honest paper fill (issue #22): a BUY fills at the side's best ASK,
     # capped by the top-of-book size. No ask means no executable entry.
     entry_price = (
@@ -1439,10 +1515,12 @@ async def _maybe_open_position(snapshot: PaperSnapshot) -> None:
         )
         if position_id is None:
             cash = await paper_wallet.cash_balance()
-            required = round(entry_price * shares, 4)
+            required = round(
+                entry_price * shares + paper_wallet.taker_fee(entry_price, shares), 4
+            )
             reason = (
-                f"paper wallet has insufficient cash: requires ${required:.2f}, "
-                f"available ${cash:.2f}"
+                f"paper wallet has insufficient cash: requires ${required:.2f} "
+                f"including the trading fee, available ${cash:.2f}"
             )
             await journal_live_order(
                 intent="ENTRY",
@@ -1471,9 +1549,12 @@ async def _maybe_open_position(snapshot: PaperSnapshot) -> None:
         if gate is not None:
             await gate.record_buy_notional(round(entry_price * shares, 4))
     label = "LIVE" if executor is not None else "Paper"
+    fee_note = ""
+    if executor is None:
+        fee_note = f" + ${paper_wallet.taker_fee(entry_price, shares):.2f} fee"
     await notify(
         "live_entry" if executor is not None else "paper_entry",
-        f"{label} BUY {snapshot.signal_side} ${notional:.2f} @ {entry_price:.3f}",
+        f"{label} BUY {snapshot.signal_side} ${notional:.2f} @ {entry_price:.3f}{fee_note}",
         {"window_slug": snapshot.window_slug, "confidence": snapshot.confidence},
     )
     log.info(
@@ -1495,6 +1576,10 @@ async def _insert_position_row(
     debit_paper_wallet: bool = False,
 ) -> int | None:
     mode = "live" if _live_executor is not None else "paper"
+    # Paper pays the venue taker fee at entry, in dollars, exactly like live
+    # (#133): every paper profit and loss is after fees (Luke, 2026-11-18).
+    # Live rows leave it NULL: the executor books its own fee-true PnL.
+    entry_fee = paper_wallet.taker_fee(entry_price, shares) if debit_paper_wallet else None
     async with connect() as db:
         await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute(
@@ -1502,8 +1587,8 @@ async def _insert_position_row(
             INSERT INTO paper_positions(
               opened_at, window_slug, market_question, side, state, entry_price,
               notional_usd, shares, opened_spot, confidence, edge, entry_reason,
-              feed_source, quote_source, strategy_style, mode
-            ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              feed_source, quote_source, strategy_style, mode, fees_usd
+            ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot.created_at,
@@ -1521,6 +1606,7 @@ async def _insert_position_row(
                 snapshot.quote_source,
                 _knobs.cached('exit_style'),
                 mode,
+                entry_fee,
             ),
         )
         position_id = int(cur.lastrowid or 0)
@@ -1531,10 +1617,12 @@ async def _insert_position_row(
                 window_slug=snapshot.window_slug,
                 transaction_type="BUY",
                 amount_usd=entry_price * shares,
+                fee_usd=entry_fee or 0.0,
                 details={
                     "entry_price": entry_price,
                     "shares": shares,
                     "notional_usd": notional,
+                    "fee_usd": entry_fee,
                 },
             )
             if cash_after is None:
@@ -1772,6 +1860,8 @@ async def _close_position(
     executor = _live_executor
     entry_price = float(pos["entry_price"])
     prior_pnl = float(pos["realized_pnl_usd"] or 0.0)
+    exit_fee = 0.0  # paper only (set below); live books fees in the executor
+    paper_fees: float | None = None
     if executor is not None and not settled:
         # Window roll / band re-entry must first cancel any unfilled resting
         # entry order before flattening whatever did fill.
@@ -1832,7 +1922,15 @@ async def _close_position(
         )
         pnl = prior_pnl + realized
     else:
-        pnl = float(pos["shares"]) * (exit_price - entry_price)
+        # Paper is fee-true like live (#133): the entry fee was paid when the
+        # trade opened (``fees_usd``; trades opened before fees were charged
+        # got it from the one-time catch-up), and a sale into the bid pays a
+        # taker fee on the way out too. A settlement pays no fee.
+        shares_held = float(pos["shares"])
+        entry_fee = float(pos.get("fees_usd") or 0.0)
+        exit_fee = 0.0 if settled else paper_wallet.taker_fee(exit_price, shares_held)
+        paper_fees = round(entry_fee + exit_fee, 4)
+        pnl = shares_held * (exit_price - entry_price) - entry_fee - exit_fee
     if executor is None:
         gate = _risk_gate
     else:
@@ -1855,10 +1953,12 @@ async def _close_position(
                     window_slug=str(pos["window_slug"]),
                     transaction_type="SETTLEMENT" if settled else "SELL",
                     amount_usd=float(pos["shares"]) * exit_price,
+                    fee_usd=exit_fee,
                     details={
                         "exit_price": exit_price,
                         "reason": reason,
                         "realized_pnl_usd": pnl,
+                        "fee_usd": exit_fee,
                     },
                 )
                 if cash_after is None:
@@ -1876,7 +1976,8 @@ async def _close_position(
             """
             UPDATE paper_positions
             SET state = 'closed', closed_at = ?, exit_price = ?,
-                closed_spot = ?, exit_reason = ?, realized_pnl_usd = ?
+                closed_spot = ?, exit_reason = ?, realized_pnl_usd = ?,
+                fees_usd = COALESCE(?, fees_usd)
             WHERE position_id = ? AND (? = 1 OR state = 'open')
             """,
             (
@@ -1885,6 +1986,7 @@ async def _close_position(
                 snapshot.spot_price,
                 reason,
                 pnl,
+                paper_fees if executor is None else None,
                 pos["position_id"],
                 1 if executor is not None else 0,
             ),

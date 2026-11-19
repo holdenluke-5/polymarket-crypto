@@ -61,6 +61,11 @@ class Rules:
     target_return: float = 0.10
     stop_return: float = -0.08
     time_exit_seconds: int = 45
+    # Several open trades (the bot's "Most trades open at once"): hold to settle
+    # makes up to this many trades per window, scalp holds up to this many at
+    # once. A new one waits ``spacing_seconds`` after the newest still held.
+    max_open: int = 1
+    spacing_seconds: int = 0
 
 
 @dataclass(frozen=True)
@@ -192,54 +197,75 @@ def simulate(windows: list[Window], rules: Rules,
         entry_edge_max=rules.edge_max, fee_rate=FEE if rules.fee_aware else 0.0,
     )
     trades: list[Trade] = []
+    limit = max(1, int(rules.max_open))
     for w in windows:
         if w.block == 0:
             continue  # training-only block, so every rule set sees the same windows
         fit = fits.get(w.block)
-        holding: tuple[str, float, float, bool] | None = None
+        # (side, ask, shares, capped, seconds left when bought)
+        holdings: list[tuple[str, float, float, bool, int]] = []
+        entries = 0
         for t in w.ticks:
             p = _decision(t, rules, fit)
             if p is None:
                 continue
-            if holding is None:
-                sig = _signal(t, p, params, rules)
-                if sig is None:
-                    continue
-                side, ask, shares = sig
-                holding = (side, ask, shares, shares < rules.shares)
-                if rules.exit_style == "settle":
-                    break
+            exited = False
+            if rules.exit_style == "scalp" and holdings:
+                kept = []
+                for h in holdings:
+                    done = _scalp_exit(t, p, h, rules, w.block)
+                    if done is None:
+                        kept.append(h)
+                    else:
+                        trades.append(done)
+                        exited = True  # scalp style may re-enter from the next tick
+                holdings = kept
+            if exited or len(holdings) >= limit:
                 continue
-            # scalp exits, priced at the held side's bid
-            side, ask, shares, capped = holding
-            bid = t.up_bid if side == "Up" else t.down_bid
-            if bid is None or not 0.0 < bid < 1.0:
+            if rules.exit_style == "settle" and entries >= limit:
+                break
+            if holdings and holdings[-1][4] - t.remaining < rules.spacing_seconds:
                 continue
-            mark = shares * (bid - ask)
-            notional = shares * ask
-            edges = [e for e in ((p - t.up_ask) if _buyable(t.up_ask) else None,
-                                 ((1 - p) - t.down_ask) if _buyable(t.down_ask) else None) if e is not None]
-            reason = None
-            if t.remaining <= rules.time_exit_seconds:
-                reason = "TIME"
-            elif mark >= notional * rules.target_return:
-                reason = "TARGET"
-            elif mark <= notional * rules.stop_return:
-                reason = "STOP"
-            elif edges and abs(max(edges)) < rules.edge_min / 2:
-                reason = "BAND"
-            if reason:
-                gross = mark
-                net = gross - shares * (_fee(ask) + _fee(bid))
-                trades.append(Trade(w.block, side, ask, shares, net, gross, reason, capped))
-                holding = None  # scalp style may re-enter later in the window
-        if holding is not None:
-            side, ask, shares, capped = holding
+            sig = _signal(t, p, params, rules)
+            if sig is None:
+                continue
+            side, ask, shares = sig
+            holdings.append((side, ask, shares, shares < rules.shares, t.remaining))
+            entries += 1
+            if rules.exit_style == "settle" and entries >= limit:
+                break
+        for side, ask, shares, capped, _left in holdings:
             won = (w.up == 1.0) == (side == "Up")
             gross = shares * ((1.0 - ask) if won else -ask)
             trades.append(Trade(w.block, side, ask, shares, gross - shares * _fee(ask), gross,
                                 "SETTLE", capped))
     return trades
+
+
+def _scalp_exit(t: Tick, p: float, holding: tuple[str, float, float, bool, int],
+                rules: Rules, block: int) -> Trade | None:
+    """The bot's scalp exits for one held trade, priced at the held side's bid."""
+    side, ask, shares, capped, _left = holding
+    bid = t.up_bid if side == "Up" else t.down_bid
+    if bid is None or not 0.0 < bid < 1.0:
+        return None
+    mark = shares * (bid - ask)
+    notional = shares * ask
+    edges = [e for e in ((p - t.up_ask) if _buyable(t.up_ask) else None,
+                         ((1 - p) - t.down_ask) if _buyable(t.down_ask) else None) if e is not None]
+    reason = None
+    if t.remaining <= rules.time_exit_seconds:
+        reason = "TIME"
+    elif mark >= notional * rules.target_return:
+        reason = "TARGET"
+    elif mark <= notional * rules.stop_return:
+        reason = "STOP"
+    elif edges and abs(max(edges)) < rules.edge_min / 2:
+        reason = "BAND"
+    if reason is None:
+        return None
+    net = mark - shares * (_fee(ask) + _fee(bid))
+    return Trade(block, side, ask, shares, net, mark, reason, capped)
 
 
 # ------------------------------------------------------------------ scoring
@@ -305,6 +331,13 @@ def _variants(base: Rules) -> list[tuple[str, str, Rules]]:
         out.append(("Fee check", "on" if v else "off", replace(base, fee_aware=v)))
     for v in (False, True):
         out.append(("Learned chances", "on" if v else "off", replace(base, learned=v)))
+    for v in (1, 2, 3, 5):
+        out.append(("Trades open at once", "1 (one at a time)" if v == 1 else str(v),
+                    replace(base, max_open=v)))
+    if base.max_open > 1:
+        for v in (0, 15, 30, 60):
+            out.append(("Wait between trades in a window", f"{v} s",
+                        replace(base, spacing_seconds=v)))
     return out
 
 
@@ -340,6 +373,8 @@ def describe(r: Rules) -> str:
         parts.append("fee check")
     if r.learned:
         parts.append("learned chances")
+    if r.max_open > 1:
+        parts.append(f"up to {r.max_open} at once, {r.spacing_seconds}s apart")
     return ", ".join(parts)
 
 
@@ -465,4 +500,6 @@ def rules_from_settings(values: dict[str, Any], exit_style: str = "settle",
         target_return=float(scalp.get("target_return", 0.10)),
         stop_return=float(scalp.get("stop_return", -0.08)),
         time_exit_seconds=int(scalp.get("time_exit_seconds", 45)),
+        max_open=max(1, int(values.get("paper_max_open_positions") or 1)),
+        spacing_seconds=max(0, int(values.get("paper_entry_spacing_seconds") or 0)),
     )

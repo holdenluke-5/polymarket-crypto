@@ -103,8 +103,7 @@ def test_switch_to_500_keeps_the_percentage_everywhere(wallet_db) -> None:
     assert p["wallet"]["initial_usd"] == 500.0
     assert p["wallet"]["pnl_pct"] == pytest.approx(-0.015)
     assert p["stats"]["total_pnl_usd"] == pytest.approx(p["wallet"]["pnl_usd"])
-    fees_before = 5 * (sv.estimated_fee(5, 0.60) + sv.estimated_fee(5, 0.70))
-    assert p["stats"]["est_fees_usd"] == pytest.approx(fees_before, abs=1e-3)
+    assert p["stats"]["fees_usd"] == 0.0  # these trades predate fee booking
     # The chart starts at $500 and has no jump at the switch.
     assert [round(pt["v"], 2) for pt in p["curve"]] == [500.0, 510.0, 492.5, 492.5]
     rescale = p["wallet"]["rescale"]
@@ -122,6 +121,30 @@ def test_switch_to_500_keeps_the_percentage_everywhere(wallet_db) -> None:
     # Accuracy profits are on the same scale as the balance.
     assert p["accuracy"]["trades"] == 3
     assert sum(b["profit_usd"] for b in p["accuracy"]["buckets"]) == pytest.approx(-3.5)
+
+    # Charging the fees these trades skipped counts the ones from before the
+    # switch 5x too, so the balance and the totals still agree after fees.
+    event = asyncio.run(paper_wallet.book_past_fees())
+    fees = 5 * (sv.estimated_fee(5, 0.60) + sv.estimated_fee(5, 0.70)) + sv.estimated_fee(10, 0.60)
+    assert event.amount_usd == pytest.approx(fees, abs=1e-3)
+    p = _screen(now)
+    assert p["wallet"]["equity_usd"] == pytest.approx(496.5 - fees, abs=1e-3)
+    assert p["stats"]["total_pnl_usd"] == pytest.approx(p["wallet"]["pnl_usd"], abs=1e-3)
+    assert p["stats"]["fees_usd"] == pytest.approx(fees, abs=1e-3)
+    assert p["wallet"]["fees_paid_usd"] == pytest.approx(fees, abs=1e-3)
+    assert p["curve"][-1]["v"] == pytest.approx(p["wallet"]["equity_usd"])
+
+
+def test_switch_cannot_be_backdated_across_fee_booking(wallet_db) -> None:
+    # Balances from before fees were charged don't include them, so a switch
+    # can't count from back then.
+    now = time.time()
+    start = int(now // 300) * 300 - 3600
+    asyncio.run(_trade(start, 5, 0.60, 5.0))
+    assert asyncio.run(paper_wallet.book_past_fees()) is not None
+    with pytest.raises(ValueError, match="before trading fees were added"):
+        asyncio.run(paper_wallet.rescale(500, as_of=_iso(now - 600)))
+    assert asyncio.run(paper_wallet.rescale(500)).factor == pytest.approx(5.0)
 
 
 def test_open_trade_keeps_its_real_size_across_the_switch(wallet_db) -> None:
@@ -237,9 +260,12 @@ def test_stored_switches_tolerate_bad_entries() -> None:
 
 def test_strategy_table_counts_this_bot_at_five_shares() -> None:
     now = 1_700_100_000.0
-    closed = [
-        {"opened_at": _iso(now - 1_800), "shares": 10, "entry_price": 0.60, "pnl_usd": 4.0},
-        {"opened_at": _iso(now - 900), "shares": 5, "entry_price": 0.60, "pnl_usd": -3.0},
+    fee5, fee10 = sv.estimated_fee(5, 0.60), sv.estimated_fee(10, 0.60)
+    closed = [  # the wallet's results, after the fees each trade paid
+        {"opened_at": _iso(now - 1_800), "shares": 10, "entry_price": 0.60,
+         "pnl_usd": 4.0 - fee10, "fee_usd": fee10},
+        {"opened_at": _iso(now - 900), "shares": 5, "entry_price": 0.60,
+         "pnl_usd": -3.0 - fee5, "fee_usd": fee5},
     ]
     raw = {
         "tick": None, "wallet": None, "trades": [], "closed": closed, "open_positions": [],
@@ -247,6 +273,5 @@ def test_strategy_table_counts_this_bot_at_five_shares() -> None:
         "learning_started": _iso(now - 3_600),
     }
     main = sv.build_payload(raw, now=now, bot=BOT, selection=SELECTION, rules=RULES)["strategies"][0]
-    fee5 = sv.estimated_fee(5, 0.60)
     assert main["trades"] == 2
     assert main["profit_after_fees_usd"] == pytest.approx((2.0 - fee5) + (-3.0 - fee5), abs=1e-4)

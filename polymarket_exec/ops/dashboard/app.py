@@ -119,6 +119,34 @@ def _log_background_task_death(name: str):
     return _cb
 
 
+async def _book_past_paper_fees() -> None:
+    """One-shot: the practice wallet pays the fees its earlier trades skipped.
+
+    Runs before the paper loop can start, so no new trade lands between the
+    restated history and the first fee-paying trade. Idempotent (config
+    ``paper.fees_from``). A failure is logged and shown, never fatal: the bot
+    still charges fees on every new trade, and the next start retries.
+    """
+    from db import notify  # type: ignore[import-untyped]
+    from polymarket_bot import paper_wallet as _pw
+
+    try:
+        event = await _pw.book_past_fees()
+    except Exception as e:  # noqa: BLE001 — never block the dashboard
+        log.error("paper_wallet.fee_catch_up_failed", error=str(e))
+        await notify(
+            "paper_fee_catch_up_failed",
+            f"Couldn't charge the fees for earlier practice trades ({e}). New trades "
+            "still pay fees; the app tries again the next time it starts.",
+        )
+        return
+    if event is not None:
+        log.info("paper_wallet.fee_catch_up", **dataclasses.asdict(event))
+        await notify(
+            "paper_fee_catch_up", _pw.describe_fee_catch_up(event), dataclasses.asdict(event)
+        )
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     await init_db()
@@ -126,6 +154,8 @@ async def _lifespan(app: FastAPI):
     # halt-ON now that the bypass applies to real money. Idempotent via sentinel.
     from polymarket_exec.execution.gate import migrate_clear_stale_bypass_v76
     await migrate_clear_stale_bypass_v76()
+    if _BTC_BOT_AVAILABLE:
+        await _book_past_paper_fees()
 
     await _paper_autostart_if_requested()
 
@@ -541,7 +571,7 @@ def _brief_html() -> str:
         "<p>This is a local BTC 5-minute binary pricing-model strategy lab. It is useful "
         "as a personal paper bot and as a compact example of trading-system "
         "discipline: market discovery, feed labeling, confidence-based sizing, "
-        "one-position risk control, structured event logs, and a dashboard kill "
+        "capped open-position risk control, structured event logs, and a dashboard kill "
         "switch.</p>\n"
         + (
             "<p><strong>Mode: LIVE — orders are real.</strong> Start places risk-gated "
@@ -563,7 +593,8 @@ def _scorecard_html() -> str:
         "<ul>\n"
         "<li>Scope: BTC 5-minute Up/Down markets only.</li>\n"
         "<li>Operator control: Start, Stop, Refresh, and activity feed.</li>\n"
-        "<li>Risk: one open paper position, bounded $1-$5 sizing, target/stop/time exits.</li>\n"
+        "<li>Risk: a capped number of open paper positions (Settings; live holds one), "
+        "fee-true paper P&amp;L, bounded sizing, target/stop/time exits.</li>\n"
         "<li>Feed discipline: public BTC fallback is labeled; Chainlink Streams is the intended reference.</li>\n"
         "<li>Auditability: ticks, simulated positions, exits, config state, and notifications persist to SQLite.</li>\n"
         "<li>Failure visibility: market/feed/loop errors surface in logs and dashboard state.</li>\n"
@@ -721,6 +752,8 @@ _SIMPLE_RULE_KNOBS: tuple[str, ...] = (
     "paper_tick_seconds",
     "paper_fee_aware",
     "paper_learning",
+    "paper_max_open_positions",
+    "paper_entry_spacing_seconds",
 )
 _SIMPLE_SIZE_KNOBS: tuple[str, ...] = ("paper_min_trade_usd", "paper_max_trade_usd")
 
@@ -776,6 +809,9 @@ async def _simple_rules(settings: dict[str, Any] | None = None) -> dict[str, Any
         "fee_aware": bool(v["paper_fee_aware"]),
         "fee_rate": _simple_view.TAKER_FEE_RATE,
         "learning": bool(v["paper_learning"]),
+        "max_open": int(v["paper_max_open_positions"]),
+        "spacing_seconds": int(v["paper_entry_spacing_seconds"]),
+        "exit_style": await _knobs.get("exit_style"),
     }
 
 
@@ -790,6 +826,8 @@ def _setting_label(name: str, value: Any) -> str:
         shown = "on" if value else "off"
     elif name == "trade_shares":
         shown = "dollar range" if value is None else f"{float(value):g} shares"
+    elif name == "paper_max_open_positions":
+        shown = str(int(value))
     else:
         shown = f"{value:g}s" if isinstance(value, (int, float)) else str(value)
     labels = {
@@ -801,6 +839,8 @@ def _setting_label(name: str, value: Any) -> str:
         "paper_tick_seconds": "check interval",
         "paper_fee_aware": "edge must beat fees",
         "paper_learning": "learned chances",
+        "paper_max_open_positions": "most trades open at once",
+        "paper_entry_spacing_seconds": "wait between trades in a window",
         "paper_min_trade_usd": "smallest trade",
         "paper_max_trade_usd": "largest trade",
         "trade_shares": "trade size",

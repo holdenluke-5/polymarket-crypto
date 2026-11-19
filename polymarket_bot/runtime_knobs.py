@@ -116,6 +116,20 @@ KNOBS: dict[str, Knob] = {
         "runtime.paper.learning", True, "bool",
         "Use learned chances", group="Paper strategy",
     ),
+    # Several open trades (Luke, 2026-11-18): paper may hold up to this many at
+    # once, and in hold-to-settle style make up to this many per window. 1 is
+    # the old one-at-a-time rule. LIVE always holds one (the executor's
+    # singleton gate); live never reads these.
+    "paper_max_open_positions": Knob(
+        "runtime.paper.max_open_positions", 3, "int",
+        "Most trades open at once", 1, 10, group="Paper strategy",
+    ),
+    # A new trade in a window that already holds an open trade waits this long
+    # after the newest one, so one signal isn't bought on several ticks in a row.
+    "paper_entry_spacing_seconds": Knob(
+        "runtime.paper.entry_spacing_seconds", 30, "int",
+        "Wait between trades in one window", 0, 240, unit="s", group="Paper strategy",
+    ),
     # --- Live risk limits (polymarket_exec/execution/gate.py, live.py) -----
     "live_daily_loss_halt_usd": Knob(
         "runtime.live.daily_loss_halt_usd", 10.0, "float",

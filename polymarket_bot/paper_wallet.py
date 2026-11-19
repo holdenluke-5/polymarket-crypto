@@ -1,6 +1,16 @@
-"""Persistent simulated cash ledger for BTC paper trades."""
+"""Persistent simulated cash ledger for BTC paper trades.
+
+Fees (2026-11-18, Luke: "include the fees in the profit and losses"): every
+taker fill pays Polymarket's fee, ``0.07 * p * (1 - p)`` dollars a share
+(``shadow/fees.py``, the same math the live executor books, #133). A row's
+``amount_usd`` stays the share value (BUY: -cost, SELL: +proceeds) and
+``fee_usd`` is the fee on that fill, so cash moves by ``amount_usd -
+fee_usd``. Trades booked before fees were charged had their fees filled in
+and charged once by :func:`book_past_fees` (config ``paper.fees_from``).
+"""
 from __future__ import annotations
 
+import bisect
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -10,8 +20,23 @@ from typing import Any, Literal
 import aiosqlite
 
 from db import connect, utc_now_iso
+from polymarket_bot.shadow.fees import taker_fee_per_share
 
 TransactionType = Literal["BUY", "SELL", "SETTLEMENT"]
+
+# When fee booking started: a ``FeeCatchUp`` dict. Present = past fees charged.
+FEES_KEY = "paper.fees_from"
+
+
+def taker_fee(price: Any, shares: Any) -> float:
+    """Venue taker fee in dollars for ``shares`` filled at ``price`` (4 dp)."""
+    try:
+        p, n = float(price), float(shares)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (0.0 < p < 1.0) or not math.isfinite(n) or n <= 0:
+        return 0.0
+    return round(taker_fee_per_share(p) * n, 4)
 
 # Starting-balance switches (2026-11-18: Luke moved the practice wallet from
 # $100 to $500). A switch multiplies the balance by new start / old start, so
@@ -22,7 +47,8 @@ MIN_START_USD = 10.0
 MAX_START_USD = 100_000.0
 MAX_BACKDATE = timedelta(hours=24)
 
-# Cost of wallet-funded BUYs that have no exit yet (the open trade, if any).
+# Share cost of wallet-funded BUYs that have no exit yet (the open trades). Their
+# entry fees were already paid from cash, so cash + this is the after-fee balance.
 _OPEN_COST_SQL = """
 SELECT COALESCE(SUM(-b.amount_usd), 0) AS cost
   FROM paper_wallet_transactions b
@@ -140,6 +166,191 @@ def balance_on_today_scale(value: float, txn_id: Any, rescales: list[Rescale]) -
     return value
 
 
+@dataclass(frozen=True)
+class FeeCatchUp:
+    """The one-time charge for trades booked before the wallet paid fees.
+
+    Wallet transactions up to ``last_txn_id`` were booked without a fee; their
+    ``fee_usd`` was filled in with what Polymarket would have charged, and the
+    wallet paid the total (on that day's balance scale) at ``at``. Balances
+    recorded before then are shown minus the fees paid up to that point.
+    """
+
+    at: str
+    last_txn_id: int
+    amount_usd: float
+    fills: int
+    trades: int
+    cash_before_usd: float
+    cash_after_usd: float
+
+
+def load_fee_catch_up(raw: str | None) -> FeeCatchUp | None:
+    if not raw:
+        return None
+    try:
+        item = json.loads(raw)
+        return FeeCatchUp(**{k: item[k] for k in FeeCatchUp.__dataclass_fields__})
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+class FeeShift:
+    """Fees already paid by each point of the pre-fee history, on today's scale.
+
+    ``events`` are ``(wallet txn id, fee on today's scale)`` for the fills the
+    catch-up covered. A balance booked at transaction ``id`` up to the catch-up
+    did not include those fees yet, so it is shown minus the ones paid by then.
+    Balances booked after the catch-up already include them.
+    """
+
+    def __init__(self, catch_up: FeeCatchUp | None, events: list[tuple[int, float]]) -> None:
+        self.last_txn_id = catch_up.last_txn_id if catch_up else -1
+        pts = sorted((int(i), float(f)) for i, f in events if int(i) <= self.last_txn_id)
+        self._ids = [i for i, _ in pts]
+        self._sums: list[float] = []
+        run = 0.0
+        for _, fee in pts:
+            run += fee
+            self._sums.append(run)
+
+    def at(self, txn_id: Any) -> float:
+        tid = _txn_id(txn_id)
+        if tid is None or tid > self.last_txn_id or not self._ids:
+            return 0.0
+        k = bisect.bisect_right(self._ids, tid)
+        return self._sums[k - 1] if k else 0.0
+
+
+async def book_past_fees() -> FeeCatchUp | None:
+    """Charge, once, the fees the trades before fee booking would have paid.
+
+    Fills every unbooked BUY/SELL fee (``fee_usd = 0``) with the venue fee for
+    its price and size, restates each such paper position's ``fees_usd`` and
+    realized PnL after fees, and debits the wallet the total on today's scale
+    (trades from before a practice balance switch count its factor, like
+    every other result). Idempotent: does nothing once ``paper.fees_from``
+    exists, and records it even when there was nothing to charge so later
+    trades are never charged twice. Returns the charge, or None when it had
+    already run or no wallet exists yet.
+    """
+    now = datetime.now(UTC).replace(microsecond=0).isoformat(timespec="seconds")
+    async with connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute(
+                "SELECT value FROM config WHERE key = ?", (FEES_KEY,)
+            ) as cur:
+                if await cur.fetchone() is not None:
+                    await db.rollback()
+                    return None
+            async with db.execute(
+                "SELECT cash_usd FROM paper_wallet WHERE wallet_id = 1"
+            ) as cur:
+                wallet = await cur.fetchone()
+            if wallet is None:
+                await db.rollback()
+                return None
+            cash = float(wallet["cash_usd"])
+            async with db.execute(
+                "SELECT value FROM config WHERE key = ?", (RESCALE_KEY,)
+            ) as cur:
+                row = await cur.fetchone()
+            rescales = load_rescales(row["value"] if row else None)
+            async with db.execute(
+                "SELECT COALESCE(MAX(id), 0) AS id FROM paper_wallet_transactions"
+            ) as cur:
+                max_id = int((await cur.fetchone())["id"])
+            async with db.execute(
+                "SELECT position_id, id FROM paper_wallet_transactions "
+                "WHERE transaction_type IN ('SELL', 'SETTLEMENT')"
+            ) as cur:
+                exit_ids = {int(r["position_id"]): int(r["id"]) for r in await cur.fetchall()}
+            async with db.execute(
+                """
+                SELECT t.id, t.position_id, t.transaction_type, p.shares,
+                       p.entry_price, p.exit_price
+                  FROM paper_wallet_transactions t
+                  JOIN paper_positions p ON p.position_id = t.position_id
+                 WHERE t.transaction_type IN ('BUY', 'SELL') AND t.fee_usd = 0
+                """
+            ) as cur:
+                fills = [dict(r) for r in await cur.fetchall()]
+            total = 0.0
+            charged = 0
+            positions: set[int] = set()
+            for f in fills:
+                price = f["entry_price"] if f["transaction_type"] == "BUY" else f["exit_price"]
+                fee = taker_fee(price, f["shares"])
+                if fee <= 0:
+                    continue
+                await db.execute(
+                    "UPDATE paper_wallet_transactions SET fee_usd = ? WHERE id = ?",
+                    (fee, f["id"]),
+                )
+                total += fee * scale_for_txn(exit_ids.get(int(f["position_id"])), rescales)
+                charged += 1
+                positions.add(int(f["position_id"]))
+            # The ledger's own PnL column, after fees too (paper rows only: live
+            # rows already carry the executor's fee-true PnL). Gross stays
+            # recoverable as realized_pnl_usd + fees_usd.
+            async with db.execute(
+                "SELECT position_id, state, shares, entry_price, exit_price "
+                "FROM paper_positions WHERE COALESCE(mode, 'paper') = 'paper' "
+                "AND fees_usd IS NULL"
+            ) as cur:
+                restate = [dict(r) for r in await cur.fetchall()]
+            for p in restate:
+                fee = taker_fee(p["entry_price"], p["shares"])
+                exit_price = p["exit_price"]
+                if p["state"] == "closed" and exit_price is not None and 0.0 < float(exit_price) < 1.0:
+                    fee += taker_fee(exit_price, p["shares"])  # sold into the bid
+                fee = round(fee, 4)
+                await db.execute(
+                    "UPDATE paper_positions SET fees_usd = ?, realized_pnl_usd = "
+                    "CASE WHEN realized_pnl_usd IS NULL THEN NULL "
+                    "ELSE realized_pnl_usd - ? END WHERE position_id = ?",
+                    (fee, fee, p["position_id"]),
+                )
+            total = round(total, 4)
+            new_cash = round(cash - total, 4)
+            cur = await db.execute(
+                "UPDATE paper_wallet SET cash_usd = ? WHERE wallet_id = 1 AND cash_usd = ?",
+                (new_cash, wallet["cash_usd"]),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("the practice balance changed while fees were charged")
+            event = FeeCatchUp(
+                at=now, last_txn_id=max_id, amount_usd=total, fills=charged,
+                trades=len(positions), cash_before_usd=round(cash, 4), cash_after_usd=new_cash,
+            )
+            await db.execute(
+                """
+                INSERT INTO config(key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                  value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (FEES_KEY, json.dumps(asdict(event)), now),
+            )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+    return event
+
+
+def describe_fee_catch_up(e: FeeCatchUp) -> str:
+    """Recent-activity line for the one-time fee charge, in plain English."""
+    if e.trades == 0:
+        return "Trading fees are now part of every practice trade."
+    return (
+        "Trading fees are now part of every practice trade and every profit and loss. "
+        f"The {e.trades} earlier trades were charged the fees they would have paid, "
+        f"${e.amount_usd:,.2f} on today's balance: ${e.cash_before_usd:,.2f} in cash became "
+        f"${e.cash_after_usd:,.2f}."
+    )
+
+
 def _local_clock(iso: str) -> str:
     """"8:12 PM" in this computer's time zone (the PC runs on Luke's local time)."""
     try:
@@ -242,6 +453,18 @@ async def rescale(start_usd: Any, *, as_of: Any = None) -> Rescale:
                 if prior:
                     earliest = datetime.fromisoformat(prior[-1].applied_at or prior[-1].at)
                 at = _as_of(as_of, now, earliest)
+                # Balances booked before fees were charged don't include them;
+                # a switch counted from back then would scale a fee-free balance.
+                async with db.execute(
+                    "SELECT value FROM config WHERE key = ?", (FEES_KEY,)
+                ) as cur:
+                    fee_row = await cur.fetchone()
+                fees_from = load_fee_catch_up(fee_row["value"] if fee_row else None)
+                if fees_from is not None and at < datetime.fromisoformat(fees_from.at):
+                    raise ValueError(
+                        "The switch can't count from before trading fees were added "
+                        f"at {_local_clock(fees_from.at)}."
+                    )
                 async with db.execute(
                     "SELECT id, cash_after_usd FROM paper_wallet_transactions "
                     "WHERE created_at <= ? ORDER BY id DESC LIMIT 1",
@@ -315,30 +538,41 @@ async def apply_cash_flow(
     window_slug: str,
     transaction_type: TransactionType,
     amount_usd: float,
+    fee_usd: float = 0.0,
     details: dict[str, object] | None = None,
 ) -> float | None:
     """Apply one cash movement inside the caller's SQLite transaction.
 
-    BUY amounts are debited; SELL and SETTLEMENT amounts are credited. ``None``
-    means the wallet is missing, cash is insufficient, or the position has no
-    wallet-funded BUY.
+    BUY amounts are debited; SELL and SETTLEMENT amounts are credited. ``fee_usd``
+    is the taker fee on the fill: a BUY debits ``amount + fee`` (and needs that
+    much cash), a SELL credits ``amount - fee``, a SETTLEMENT pays no fee.
+    ``None`` means the wallet is missing, cash is insufficient, or the position
+    has no wallet-funded BUY.
     """
     amount = round(float(amount_usd), 4)
+    fee = round(float(fee_usd or 0.0), 4)
     if not math.isfinite(amount) or amount < 0:
         raise ValueError("paper wallet cash flow must be a finite non-negative amount")
+    if not math.isfinite(fee) or fee < 0:
+        raise ValueError("paper wallet fee must be a finite non-negative amount")
     if transaction_type == "BUY" and amount <= 0:
         raise ValueError("paper wallet BUY debit must be greater than zero")
     if transaction_type not in {"BUY", "SELL", "SETTLEMENT"}:
         raise ValueError(f"unsupported paper wallet transaction: {transaction_type}")
+    if transaction_type == "SETTLEMENT" and fee:
+        raise ValueError("a settlement pays no trading fee")
+    if transaction_type == "SELL" and fee > amount:
+        raise ValueError("a sale's fee can't exceed its proceeds")
 
     if transaction_type == "BUY":
+        debit = round(amount + fee, 4)
         cursor = await db.execute(
             """
             UPDATE paper_wallet
                SET cash_usd = ROUND(cash_usd - ?, 4)
              WHERE wallet_id = 1 AND ROUND(cash_usd, 4) >= ?
             """,
-            (amount, amount),
+            (debit, debit),
         )
     else:
         async with db.execute(
@@ -356,7 +590,7 @@ async def apply_cash_flow(
                SET cash_usd = ROUND(cash_usd + ?, 4)
              WHERE wallet_id = 1
             """,
-            (amount,),
+            (round(amount - fee, 4),),
         )
 
     if cursor.rowcount != 1:
@@ -372,8 +606,8 @@ async def apply_cash_flow(
         """
         INSERT INTO paper_wallet_transactions(
           created_at, position_id, window_slug, transaction_type,
-          amount_usd, cash_after_usd, details_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          amount_usd, fee_usd, cash_after_usd, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             utc_now_iso(),
@@ -381,6 +615,7 @@ async def apply_cash_flow(
             window_slug,
             transaction_type,
             -amount if transaction_type == "BUY" else amount,
+            fee,
             cash_after,
             json.dumps(details or {}, sort_keys=True),
         ),

@@ -119,7 +119,13 @@ Out of scope:
   5-minute BTC work closed 2026-08-29 (#182); no replacement category is chosen
   or built. Research and shadow-only work on any market/timeframe remains in
   scope by default — see Scope Fence above.
-- One open BTC paper position at a time.
+- BTC paper positions are capped by the operator's "Most trades open at once"
+  setting (`runtime.paper.max_open_positions`, default 3; 1 = one at a time),
+  which also caps hold-to-settle entries per window, with a minimum wait between
+  entries in one window (`runtime.paper.entry_spacing_seconds`). Live always
+  holds one open position. (Operator decision, 2026-11-18.)
+- Paper profit and loss is fee-true: the paper wallet pays the venue taker fee
+  on every taker fill, like the live executor (#133).
 - **Live trading is BUILT and multi-gated** (`polymarket_exec/execution/live.py:LiveExecutor`).
   It runs only when the operator **clicks LIVE in the dashboard**
   **AND** a private key **AND** a coherent wallet **AND** a clean config parse — then
@@ -179,6 +185,6 @@ Optional snapshot:
 <!-- BEGIN GENERATED:summary -->
 - **Trees:** `polymarket_bot/` = live loop + signal math; `polymarket_exec/` = execution/connectors/dashboard/backtest; top-level `config.py`/`db.py`/`logging_setup.py` = foundation. Both ACTIVE, bidirectionally coupled.
 - **Entry:** `python main.py` → FastAPI `polymarket_exec/ops/dashboard/app.py`; loop starts on operator ▶ Start → `polymarket_bot/controller.py:request_start`.
-- **Tests:** 1133.
+- **Tests:** 1222.
 - **Built-but-dead (do not edit expecting runtime effect):** `polymarket_bot/chronos_signal.py`, `polymarket_exec/backtest/conditional.py`, `polymarket_exec/backtest/harness.py`, `polymarket_exec/connectors/base.py`, `polymarket_exec/connectors/binance.py`, `polymarket_exec/connectors/chainlink.py`, `polymarket_exec/connectors/polymarket.py`, `polymarket_exec/ops/controller.py`, `polymarket_exec/ops/dashboard/panels/_shared.py`, `polymarket_exec/storage/replay.py`, `polymarket_exec/strategy/signal.py`.
 <!-- END GENERATED:summary -->

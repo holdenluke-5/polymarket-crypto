@@ -275,6 +275,8 @@ def current_rules() -> Any:
         target_return=float(_knobs.cached("paper_target_return")),
         stop_return=float(_knobs.cached("paper_stop_return")),
         time_exit_seconds=int(_knobs.cached("paper_time_exit_seconds")),
+        max_open=max(1, int(_knobs.cached("paper_max_open_positions") or 1)),
+        spacing_seconds=max(0, int(_knobs.cached("paper_entry_spacing_seconds") or 0)),
     )
 
 

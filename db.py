@@ -290,6 +290,17 @@ POSITION_COLUMN_MIGRATIONS = {
     # executor was attached. Legacy rows are backfilled by joining
     # live_orders on window_slug.
     "mode": "TEXT",
+    # Paper only: taker fees this position paid (entry, plus a sale's exit
+    # fee). realized_pnl_usd is after them; gross = realized + fees. NULL on
+    # live rows (the executor's PnL is already fee-true, #133).
+    "fees_usd": "REAL",
+}
+
+# Paper wallet: the taker fee on each fill. Cash moves by amount_usd - fee_usd
+# (see polymarket_bot/paper_wallet.py). Rows from before fee booking get theirs
+# filled in once by paper_wallet.book_past_fees.
+WALLET_TXN_COLUMN_MIGRATIONS = {
+    "fee_usd": "REAL NOT NULL DEFAULT 0",
 }
 
 # Issue #22: executable top-of-book quotes journaled per tick. Rows without
@@ -387,6 +398,9 @@ async def init_db() -> None:
         await db.executescript(SCHEMA)
         await _rename_legacy_config_keys(db)
         await _migrate_columns(db, "paper_positions", POSITION_COLUMN_MIGRATIONS)
+        await _migrate_columns(
+            db, "paper_wallet_transactions", WALLET_TXN_COLUMN_MIGRATIONS
+        )
         await _migrate_columns(db, "paper_ticks", TICK_COLUMN_MIGRATIONS)
         await _migrate_columns(db, "live_orders", LIVE_ORDERS_COLUMN_MIGRATIONS)
         await _migrate_columns(

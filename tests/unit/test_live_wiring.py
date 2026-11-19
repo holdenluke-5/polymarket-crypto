@@ -94,14 +94,18 @@ async def test_paper_entry_does_not_touch_live_executor(bot_db) -> None:
     assert len(rows) == 1
     assert rows[0]["entry_price"] == 0.57
     assert rows[0]["notional_usd"] == 3.0
-    assert await paper_wallet.cash_balance() == pytest.approx(97.0)
+    # The paper wallet pays the taker fee on top of the $3.00 of shares.
+    fee = paper_wallet.taker_fee(0.57, 3.0 / 0.57)
+    assert rows[0]["fees_usd"] == pytest.approx(fee)
+    assert await paper_wallet.cash_balance() == pytest.approx(97.0 - fee)
     async with bot_db.connect() as conn:
         async with conn.execute(
-            "SELECT transaction_type, amount_usd FROM paper_wallet_transactions"
+            "SELECT transaction_type, amount_usd, fee_usd FROM paper_wallet_transactions"
         ) as cur:
             transaction = await cur.fetchone()
     assert transaction["transaction_type"] == "BUY"
     assert transaction["amount_usd"] == pytest.approx(-3.0)
+    assert transaction["fee_usd"] == pytest.approx(fee)
 
 
 def test_paper_detail_tolerates_missing_up_ask() -> None:
@@ -123,7 +127,10 @@ async def test_paper_close_does_not_touch_live_executor(bot_db) -> None:
     assert rows[0]["state"] == "closed"
     assert rows[0]["exit_reason"] == "TARGET"
     balance_after_close = await paper_wallet.cash_balance()
-    assert balance_after_close == pytest.approx(100.1579)
+    shares = 3.0 / 0.57
+    fees = paper_wallet.taker_fee(0.57, shares) + paper_wallet.taker_fee(0.60, shares)
+    assert balance_after_close == pytest.approx(100.1579 - fees, abs=1e-4)
+    assert rows[0]["realized_pnl_usd"] == pytest.approx(shares * 0.03 - fees, abs=1e-4)
     assert not await paper._close_position(pos, _snapshot(), 0.60, "TARGET")
     assert await paper_wallet.cash_balance() == pytest.approx(balance_after_close)
 
@@ -137,9 +144,10 @@ async def test_paper_wallet_marks_open_contract_at_current_bid(bot_db) -> None:
     )
 
     assert snapshot is not None
-    assert snapshot["cash"] == pytest.approx(97.0)
+    fee = paper_wallet.taker_fee(0.57, 3.0 / 0.57)
+    assert snapshot["cash"] == pytest.approx(97.0 - fee)
     assert snapshot["positions"] == pytest.approx(3.1579)
-    assert snapshot["equity"] == pytest.approx(100.1579)
+    assert snapshot["equity"] == pytest.approx(100.1579 - fee)
     assert snapshot["mark_source"] == "current_bid"
 
 
@@ -152,7 +160,9 @@ async def test_paper_settlement_credits_virtual_wallet(bot_db) -> None:
         pos, _snapshot(), 1.0, "WINDOW_ROLL", settled=True
     )
 
-    assert await paper_wallet.cash_balance() == pytest.approx(102.2632)
+    # A settlement pays no fee; the entry fee was paid when the trade opened.
+    fee = paper_wallet.taker_fee(0.57, 3.0 / 0.57)
+    assert await paper_wallet.cash_balance() == pytest.approx(102.2632 - fee)
     async with bot_db.connect() as conn:
         async with conn.execute(
             "SELECT transaction_type, amount_usd FROM paper_wallet_transactions "
